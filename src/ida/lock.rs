@@ -431,7 +431,17 @@ fn try_lock_file(file: &File) -> Result<(), u32> {
 
 #[cfg(not(unix))]
 fn try_lock_file(file: &File) -> Result<(), u32> {
-    file.try_lock().map_err(|_| 0)
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        // ERROR_INVALID_FUNCTION (win32 1): the filesystem does not implement
+        // byte-range locks (WSL \\wsl.localhost serves 9p, which rejects
+        // LockFileEx outright). No process can hold such a lock there, so the
+        // advisory lock is meaningless — skip it. Genuine contention on
+        // NTFS/SMB surfaces as TryLockError::WouldBlock / ERROR_LOCK_VIOLATION
+        // (33) and stays Err.
+        Err(std::fs::TryLockError::Error(e)) if e.raw_os_error() == Some(1) => Ok(()),
+        Err(_) => Err(0),
+    }
 }
 
 #[cfg(unix)]
