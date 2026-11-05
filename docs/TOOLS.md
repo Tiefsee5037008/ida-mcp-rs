@@ -5,7 +5,7 @@
 
 ## Discovery Workflow
 
-- `tools/list` returns 75 baseline tools by default (82 registered including opt-in workspace and debugger tools)
+- `tools/list` returns 76 baseline tools by default (83 registered including opt-in workspace and debugger tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
 - Debugger tools require `--enable-debugger`; `debug_open_module` also requires `--workspace`
@@ -35,6 +35,7 @@ Database open/close and discovery tools
 | `open_dsc` | Open a dyld_shared_cache and load one module; use dsc_add_dylib/dsc_add_region for more |
 | `open_idb` | Open an IDA database or raw binary |
 | `recent_operations` | Inspect recent foreground operation history |
+| `save_idb` | Save the open database without closing it |
 | `task_status` | Check status of a background task (e.g. DSC loading) |
 | `tool_catalog` | Discover available tools by query or category |
 | `tool_help` | Get full documentation for a tool |
@@ -46,8 +47,7 @@ List, search, and resolve functions
 | Tool | Description |
 |------|-------------|
 | `analyze_funcs` | Run auto-analysis (foreground or background task) |
-| `function_at` | Find the function containing an address |
-| `list_funcs` | Alias of list_functions |
+| `function_at` | Find the function containing one address |
 | `list_functions` | List functions with pagination and filtering |
 | `lookup_funcs` | Batch lookup multiple functions by name |
 | `resolve_function` | Find function address by name |
@@ -58,9 +58,9 @@ Disassemble code at addresses
 
 | Tool | Description |
 |------|-------------|
-| `disasm` | Disassemble instructions at an address |
+| `disasm` | Disassemble instructions at one or more addresses |
 | `disasm_by_name` | Disassemble a function by name |
-| `disasm_function_at` | Disassemble the function containing an address |
+| `disasm_function_at` | Disassemble the function containing one address |
 | `render_range` | Render an IDA-style address range |
 
 ## Decompile (`decompile`)
@@ -69,8 +69,10 @@ Decompile functions to pseudocode (requires Hex-Rays)
 
 | Tool | Description |
 |------|-------------|
-| `decompile` | Decompile function to C pseudocode |
-| `pseudocode_at` | Get pseudocode for specific address/range |
+| `decompile` | Decompile one or more functions to C pseudocode |
+| `list_lvars` | List decompiler locals and arguments in one function |
+| `list_pseudocode_comments` | List pseudocode comment locations in one function |
+| `pseudocode_at` | Get pseudocode for one or more addresses/ranges |
 
 ## Xrefs (`xrefs`)
 
@@ -79,8 +81,8 @@ Cross-reference analysis (xrefs to/from)
 | Tool | Description |
 |------|-------------|
 | `xref_matrix` | Build xref matrix between addresses |
-| `xrefs_from` | Find all references FROM an address |
-| `xrefs_to` | Find all references TO an address |
+| `xrefs_from` | Find all references FROM one or more addresses |
+| `xrefs_to` | Find all references TO one or more addresses |
 | `xrefs_to_field` | Xrefs to a struct field |
 | `xrefs_to_string` | Find xrefs to strings matching a query |
 
@@ -90,10 +92,10 @@ Basic blocks, call graphs, control flow
 
 | Tool | Description |
 |------|-------------|
-| `basic_blocks` | Get basic blocks of a function |
-| `callees` | Find all functions called by a function |
-| `callers` | Find all callers of a function |
-| `callgraph` | Build call graph from a function |
+| `basic_blocks` | Get basic blocks of one or more functions |
+| `callees` | Find all functions called by one or more functions |
+| `callers` | Find all callers of one or more functions |
+| `callgraph` | Build call graph from one or more root functions |
 | `find_paths` | Find control-flow paths between two addresses |
 
 ## Memory (`memory`)
@@ -102,14 +104,10 @@ Read bytes, strings, and data
 
 | Tool | Description |
 |------|-------------|
-| `get_bytes` | Read raw bytes from an address |
+| `get_bytes` | Read raw bytes from one or more addresses |
 | `get_global_value` | Read global value by name or address |
-| `get_string` | Read string at an address |
-| `get_u16` | Read 16-bit value |
-| `get_u32` | Read 32-bit value |
-| `get_u64` | Read 64-bit value |
-| `get_u8` | Read 8-bit value |
-| `int_convert` | Convert integers between bases |
+| `get_string` | Read strings at one or more addresses |
+| `read_int` | Read unsigned integers of a given byte width at one or more addresses |
 
 ## Search (`search`)
 
@@ -131,7 +129,7 @@ Database info, segments, imports, exports
 
 | Tool | Description |
 |------|-------------|
-| `addr_info` | Resolve address to segment/function/symbol |
+| `addr_info` | Resolve one address to segment/function/symbol |
 | `entrypoints` | List entry points |
 | `export_funcs` | Export functions (JSON) |
 | `exports` | List exported functions |
@@ -150,11 +148,12 @@ Types, structs, and stack variable info
 | `declare_stack` | Declare a stack variable |
 | `declare_type` | Declare a type in the local type library |
 | `delete_stack` | Delete a stack variable |
-| `infer_types` | Infer/guess type at an address |
+| `infer_types` | Infer/guess type at one address |
 | `local_types` | List local types |
-| `read_struct` | Read a struct instance at an address |
+| `read_struct` | Read struct instances at one or more addresses |
 | `search_structs` | Search structs by name |
-| `stack_frame` | Get stack frame info |
+| `set_lvar_type` | Set the type of one exact decompiler local variable |
+| `stack_frame` | Get stack frame info for one function |
 | `struct_info` | Get struct info by name or ordinal |
 | `structs` | List structs with pagination |
 
@@ -169,7 +168,9 @@ Patching, renaming, and comment editing
 | `patch` | Patch bytes at an address |
 | `patch_asm` | Patch instructions with assembly text |
 | `rename` | Rename symbols |
-| `set_comments` | Set comments at an address |
+| `rename_lvar` | Rename one exact decompiler local variable |
+| `set_comments` | Set a disassembly comment at an address |
+| `set_pseudocode_comment` | Set a persistent pseudocode comment |
 
 ## Debug (`debug`)
 
@@ -194,7 +195,7 @@ Execute Python scripts via IDAPython
 
 ## Notes
 
-- Many tools accept a single value or array (e.g., `"0x1000"` or `["0x1000", "0x2000"]`)
+- Tools whose description says "one or more" accept a single value or an array (e.g., `"0x1000"` or `["0x1000", "0x2000"]`) and return one result per value; tools that say "one address" reject arrays with more than one element
 - String inputs may be comma-separated: `"0x1000, 0x2000"`
 - Addresses accept hex (`0x1000`) or decimal (`4096`)
 - Raw binaries default to `<input>.i64`; use `idb_out` for read-only input locations. Existing output is reused only after input SHA-256 verification

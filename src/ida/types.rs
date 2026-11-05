@@ -1,5 +1,6 @@
 //! Response types for IDA worker operations.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +87,8 @@ impl RawBinaryTarget {
 pub struct DbInfo {
     pub path: String,
     pub file_type: String,
+    /// IDA's loader description; names the chosen slice for fat inputs.
+    pub loader: String,
     pub processor: String,
     pub bits: u32,
     pub function_count: usize,
@@ -125,7 +128,7 @@ pub struct DebugInfoLoad {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct AnalysisStatus {
     pub auto_enabled: bool,
     pub auto_is_ok: bool,
@@ -168,7 +171,7 @@ pub struct SymbolInfo {
     pub is_weak: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct FunctionRangeInfo {
     pub address: String,
     pub name: String,
@@ -186,7 +189,7 @@ pub struct AddressInfo {
 }
 
 /// Function info for listing
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct FunctionInfo {
     pub address: String,
     pub name: String,
@@ -194,7 +197,7 @@ pub struct FunctionInfo {
 }
 
 /// Paginated function list result
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct FunctionListResult {
     pub functions: Vec<FunctionInfo>,
     pub total: usize,
@@ -215,7 +218,7 @@ pub struct SegmentInfo {
 }
 
 /// String info
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct StringInfo {
     pub address: String,
     pub content: String,
@@ -223,7 +226,7 @@ pub struct StringInfo {
 }
 
 /// String list result with pagination
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct StringListResult {
     pub strings: Vec<StringInfo>,
     pub total: usize,
@@ -370,7 +373,7 @@ pub struct StructReadResult {
 }
 
 /// Cross-reference info
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct XRefInfo {
     pub from: String,
     pub to: String,
@@ -384,7 +387,7 @@ pub struct XRefInfo {
 /// `next_offset` carries the offset to pass on the next call to page through
 /// the remaining references. High-frequency targets can have enormous xref
 /// counts, so enumeration is always bounded.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct XRefListResult {
     pub xrefs: Vec<XRefInfo>,
     pub truncated: bool,
@@ -414,6 +417,7 @@ pub struct ApplyTypeResult {
     pub address: String,
     pub applied: bool,
     pub source: String,
+    pub target: MutationTarget,
 }
 
 /// Guess type result
@@ -434,6 +438,115 @@ pub struct StackVarResult {
     pub offset: i64,
     pub code: i32,
     pub status: String,
+    pub target: MutationTarget,
+}
+
+/// Which selector a mutating tool's caller used for its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetSelector {
+    Address,
+    Name,
+}
+
+/// The exact target a tool resolved, recorded before it acted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct MutationTarget {
+    /// Database the tool acted on, as `open_idb` reported it.
+    pub database: Option<String>,
+    pub selector: TargetSelector,
+    /// Name at `base` before the tool acted: the exact name that was matched,
+    /// or the listed name at a given address. `None` when that address has
+    /// no listed name; nearby or generated names are never substituted.
+    pub symbol: Option<String>,
+    /// Address the selector resolved to.
+    pub base: String,
+    /// `base` plus the caller's `offset`: the address the caller asked for.
+    pub requested_address: String,
+    /// Address the tool acted on. Equal to `requested_address` except where
+    /// a tool normalizes it: `lumina_apply` and the decompiler tools act on
+    /// the start of the function containing `requested_address`.
+    pub address: String,
+}
+
+/// One local or argument from a Hex-Rays decompilation.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct LocalVariableInfo {
+    pub name: String,
+    pub type_name: String,
+    pub location: String,
+    /// Opaque SDK identity; prefer it over a display name when editing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u32>,
+    pub is_argument: bool,
+    pub has_user_name: bool,
+    pub has_user_type: bool,
+}
+
+pub enum LocalVariableSelector {
+    Name(String),
+    Locator(String),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ListLvarsResult {
+    pub target: MutationTarget,
+    pub lvars: Vec<LocalVariableInfo>,
+    pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RenameLvarResult {
+    pub target: MutationTarget,
+    /// The local variable before the edit.
+    pub variable: LocalVariableInfo,
+    pub new_name: String,
+    pub renamed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SetLvarTypeResult {
+    pub target: MutationTarget,
+    /// The local variable before the edit.
+    pub variable: LocalVariableInfo,
+    pub type_name: String,
+    pub applied: bool,
+}
+
+/// One end-of-line comment location in a Hex-Rays decompilation.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct PseudocodeCommentInfo {
+    /// Opaque location identity for set_pseudocode_comment.
+    pub locator: String,
+    pub address: String,
+    /// One-based line in the rendered pseudocode.
+    pub line_number: u32,
+    /// The rendered line, including any existing comment.
+    pub text: String,
+    /// The complete existing comment, or empty.
+    pub comment: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ListPseudocodeCommentsResult {
+    pub target: MutationTarget,
+    pub locations: Vec<PseudocodeCommentInfo>,
+    pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SetPseudocodeCommentResult {
+    pub target: MutationTarget,
+    pub comment_locator: String,
+    pub deleted: bool,
 }
 
 /// Xrefs to a struct field

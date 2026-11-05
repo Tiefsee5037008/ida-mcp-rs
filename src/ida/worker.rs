@@ -53,7 +53,7 @@ pub(crate) enum CloseAuthorization {
 
 /// Internal state for close token ownership.
 #[derive(Debug, Default)]
-struct CloseTokenState {
+pub(crate) struct CloseTokenState {
     token: Mutex<Option<CloseTokenLease>>,
 }
 
@@ -69,7 +69,7 @@ impl CloseTokenState {
         uuid::Uuid::new_v4().simple().to_string()
     }
 
-    fn issue_for_session(&self, session_id: &str) -> Result<CloseTokenGrant, String> {
+    pub(crate) fn issue_for_session(&self, session_id: &str) -> Result<CloseTokenGrant, String> {
         let mut guard = self.lock_token();
         if let Some(lease) = guard.as_ref() {
             if lease.owner_session_id == session_id {
@@ -95,7 +95,7 @@ impl CloseTokenState {
         })
     }
 
-    fn authorize_close(
+    pub(crate) fn authorize_close(
         &self,
         session_id: &str,
         token: Option<&str>,
@@ -118,18 +118,16 @@ impl CloseTokenState {
             }
         }
     }
-
-    fn clear(&self) {
-        let mut guard = self.lock_token();
-        *guard = None;
-    }
 }
 
 /// Handle for sending requests to the main thread IDA worker
 #[derive(Clone)]
 pub struct IdaWorker {
     tx: mpsc::SyncSender<IdaRequest>,
-    close_token: Arc<CloseTokenState>,
+    /// A child under a supervising parent applies no deadline of its own:
+    /// answering early would leave its IDA thread stuck while the parent
+    /// keeps the worker, so the parent's watchdog is the only bound.
+    supervised: bool,
 }
 
 /// Cancels a side effect that is still queued if its awaiting request future
@@ -151,29 +149,21 @@ impl IdaWorker {
     pub fn new(tx: mpsc::SyncSender<IdaRequest>) -> Self {
         Self {
             tx,
-            close_token: Arc::new(CloseTokenState::default()),
+            supervised: false,
         }
     }
 
-    pub(crate) fn issue_close_token_for_session(
-        &self,
-        session_id: &str,
-    ) -> Result<CloseTokenGrant, String> {
-        self.close_token.issue_for_session(session_id)
+    /// A worker hosted in a child process whose parent enforces deadlines.
+    pub fn supervised(tx: mpsc::SyncSender<IdaRequest>) -> Self {
+        Self {
+            supervised: true,
+            ..Self::new(tx)
+        }
     }
 
-    pub(crate) fn authorize_close(
-        &self,
-        session_id: &str,
-        token: Option<&str>,
-        force: bool,
-    ) -> CloseAuthorization {
-        self.close_token.authorize_close(session_id, token, force)
-    }
-
-    pub(crate) fn clear_close_token(&self) {
-        self.close_token.clear();
-    }
+    /// Deadline a child under supervision applies to its own requests: none
+    /// in practice, so the parent's kill is what ends a stuck native call.
+    const SUPERVISED_TIMEOUT_SECS: u64 = 60 * 60 * 24 * 365;
 
     fn try_send(&self, req: IdaRequest) -> Result<(), ToolError> {
         match self.tx.try_send(req) {
@@ -207,8 +197,12 @@ impl IdaWorker {
         }
     }
 
-    /// Caller-supplied timeout, defaulted and clamped to the worker maximum.
-    fn clamped_timeout(timeout_secs: Option<u64>) -> Duration {
+    /// Caller-supplied timeout, defaulted and clamped to the worker maximum;
+    /// effectively unbounded under supervision.
+    fn clamped_timeout(&self, timeout_secs: Option<u64>) -> Duration {
+        if self.supervised {
+            return Duration::from_secs(Self::SUPERVISED_TIMEOUT_SECS);
+        }
         Duration::from_secs(
             timeout_secs
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -219,10 +213,11 @@ impl IdaWorker {
     /// Bound a read-only request. Mutations must use [`Self::recv_side_effect`]
     /// so a receiver timeout cannot abandon queued work that later runs.
     async fn recv_read_only_with_timeout<T>(
+        &self,
         rx: oneshot::Receiver<Result<T, ToolError>>,
         timeout_secs: Option<u64>,
     ) -> Result<T, ToolError> {
-        let timeout = Self::clamped_timeout(timeout_secs);
+        let timeout = self.clamped_timeout(timeout_secs);
         match tokio::time::timeout(timeout, rx).await {
             Ok(result) => result?,
             Err(_) => Err(ToolError::Timeout(timeout.as_secs())),
@@ -232,12 +227,13 @@ impl IdaWorker {
     /// Bound queueing time for a request with side effects without abandoning
     /// an operation that the IDA thread already started.
     async fn recv_side_effect<T>(
+        &self,
         mut rx: oneshot::Receiver<Result<T, ToolError>>,
         admission: SideEffectAdmission,
         timeout_secs: Option<u64>,
     ) -> Result<T, ToolError> {
         let wait_guard = SideEffectWaitGuard { admission };
-        let timeout = Self::clamped_timeout(timeout_secs);
+        let timeout = self.clamped_timeout(timeout_secs);
         match tokio::time::timeout(timeout, &mut rx).await {
             Ok(result) => result?,
             Err(_) if wait_guard.admission.cancel_if_queued() => {
@@ -261,7 +257,6 @@ impl IdaWorker {
         debug_info_verbose: bool,
         force: bool,
         rebuild: bool,
-        file_type: Option<String>,
         auto_analyse: bool,
         raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
@@ -277,7 +272,6 @@ impl IdaWorker {
             debug_info_verbose,
             force,
             rebuild,
-            file_type,
             auto_analyse,
             raw_target,
             extra_args,
@@ -301,7 +295,6 @@ impl IdaWorker {
         debug_info_verbose: bool,
         force: bool,
         rebuild: bool,
-        file_type: Option<String>,
         auto_analyse: bool,
         raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
@@ -318,7 +311,6 @@ impl IdaWorker {
             debug_info_verbose,
             force,
             rebuild,
-            file_type,
             auto_analyse,
             raw_target,
             extra_args,
@@ -345,11 +337,7 @@ impl IdaWorker {
             Some(Duration::from_secs(CLOSE_SEND_TIMEOUT_SECS)),
         )
         .await?;
-        let result = rx.await.map_err(|_| ToolError::WorkerClosed)??;
-        if result == ConditionalCloseResult::Closed {
-            self.clear_close_token();
-        }
-        Ok(result)
+        rx.await.map_err(|_| ToolError::WorkerClosed)?
     }
 
     /// Close the currently open database.
@@ -402,7 +390,7 @@ impl IdaWorker {
             admission: admission.clone(),
             resp: tx,
         })?;
-        Self::recv_side_effect(
+        self.recv_side_effect(
             rx,
             admission,
             Some(debugger_response_timeout_secs(timeout_seconds)),
@@ -419,7 +407,7 @@ impl IdaWorker {
             admission: admission.clone(),
             resp: tx,
         })?;
-        Self::recv_side_effect(
+        self.recv_side_effect(
             rx,
             admission,
             Some(debugger_response_timeout_secs(timeout_seconds)),
@@ -430,7 +418,8 @@ impl IdaWorker {
     pub async fn debug_modules(&self) -> Result<Value, ToolError> {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::DebugModules { resp: tx })?;
-        Self::recv_read_only_with_timeout(rx, Some(DEBUG_MODULES_TIMEOUT_SECS)).await
+        self.recv_read_only_with_timeout(rx, Some(DEBUG_MODULES_TIMEOUT_SECS))
+            .await
     }
 
     pub async fn debug_stop(
@@ -446,7 +435,7 @@ impl IdaWorker {
             admission: admission.clone(),
             resp: tx,
         })?;
-        Self::recv_side_effect(
+        self.recv_side_effect(
             rx,
             admission,
             Some(debugger_response_timeout_secs(timeout_seconds)),
@@ -499,7 +488,7 @@ impl IdaWorker {
             admission: admission.clone(),
             resp: tx,
         })?;
-        Self::recv_side_effect(rx, admission, timeout_secs).await
+        self.recv_side_effect(rx, admission, timeout_secs).await
     }
 
     /// Load a DSC region into the current database via IDA's native dscu service.
@@ -515,7 +504,7 @@ impl IdaWorker {
             admission: admission.clone(),
             resp: tx,
         })?;
-        Self::recv_side_effect(rx, admission, timeout_secs).await
+        self.recv_side_effect(rx, admission, timeout_secs).await
     }
 
     /// Shutdown the IDA worker loop.
@@ -538,7 +527,7 @@ impl IdaWorker {
             filter,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Resolve a function by name (exact or partial match).
@@ -596,6 +585,107 @@ impl IdaWorker {
         rx.await?
     }
 
+    pub async fn list_lvars(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<ListLvarsResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::ListLvars {
+            addr,
+            name,
+            offset,
+            limit,
+            resp: tx,
+        })?;
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
+    }
+
+    pub async fn rename_lvar(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        selector: LocalVariableSelector,
+        new_name: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<RenameLvarResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
+        self.try_send(IdaRequest::RenameLvar {
+            addr,
+            name,
+            selector,
+            new_name,
+            admission: admission.clone(),
+            resp: tx,
+        })?;
+        self.recv_side_effect(rx, admission, timeout_secs).await
+    }
+
+    pub async fn set_lvar_type(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        selector: LocalVariableSelector,
+        decl: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<SetLvarTypeResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
+        self.try_send(IdaRequest::SetLvarType {
+            addr,
+            name,
+            selector,
+            decl,
+            admission: admission.clone(),
+            resp: tx,
+        })?;
+        self.recv_side_effect(rx, admission, timeout_secs).await
+    }
+
+    pub async fn list_pseudocode_comments(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<ListPseudocodeCommentsResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::ListPseudocodeComments {
+            addr,
+            name,
+            offset,
+            limit,
+            resp: tx,
+        })?;
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
+    }
+
+    pub async fn set_pseudocode_comment(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        locator: String,
+        comment: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<SetPseudocodeCommentResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
+        self.try_send(IdaRequest::SetPseudocodeComment {
+            addr,
+            name,
+            locator,
+            comment,
+            admission: admission.clone(),
+            resp: tx,
+        })?;
+        self.recv_side_effect(rx, admission, timeout_secs).await
+    }
+
     /// List all segments.
     pub async fn segments(&self) -> Result<Vec<SegmentInfo>, ToolError> {
         let (tx, rx) = oneshot::channel();
@@ -618,7 +708,7 @@ impl IdaWorker {
             filter,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// List local types with pagination and optional filter.
@@ -636,7 +726,7 @@ impl IdaWorker {
             filter,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Declare a type (single or multi).
@@ -824,7 +914,7 @@ impl IdaWorker {
             filter,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Get struct info by ordinal or name.
@@ -874,7 +964,7 @@ impl IdaWorker {
             limit,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Get cross-references from an address.
@@ -892,7 +982,7 @@ impl IdaWorker {
             limit,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Get xrefs to a struct field.
@@ -959,7 +1049,7 @@ impl IdaWorker {
             offset,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     pub async fn lumina_apply(
@@ -1148,7 +1238,7 @@ impl IdaWorker {
             limit,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Analyze strings (with xrefs).
@@ -1166,7 +1256,7 @@ impl IdaWorker {
             limit,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Find strings matching a query.
@@ -1188,7 +1278,7 @@ impl IdaWorker {
             limit,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Get xrefs to strings matching a query.
@@ -1213,7 +1303,7 @@ impl IdaWorker {
             max_xrefs,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Run auto-analysis (functions) and wait for completion.
@@ -1226,7 +1316,7 @@ impl IdaWorker {
             admission: admission.clone(),
             resp: tx,
         })?;
-        Self::recv_side_effect(rx, admission, timeout_secs).await
+        self.recv_side_effect(rx, admission, timeout_secs).await
     }
 
     /// Run auto-analysis (functions) and stream progress for foreground callers.
@@ -1259,7 +1349,7 @@ impl IdaWorker {
             max_results,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Search text in the database.
@@ -1275,7 +1365,7 @@ impl IdaWorker {
             max_results,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Search immediate values in the database.
@@ -1291,7 +1381,7 @@ impl IdaWorker {
             max_results,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Find instruction sequences by mnemonic patterns.
@@ -1309,7 +1399,7 @@ impl IdaWorker {
             case_insensitive,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Find instruction operands by operand substring patterns.
@@ -1327,7 +1417,7 @@ impl IdaWorker {
             case_insensitive,
             resp: tx,
         })?;
-        Self::recv_read_only_with_timeout(rx, timeout_secs).await
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
     }
 
     /// Read integer value of size (1/2/4/8) at address.
@@ -1338,6 +1428,13 @@ impl IdaWorker {
             size,
             resp: tx,
         })?;
+        rx.await?
+    }
+
+    /// Write the open database to disk without closing it.
+    pub async fn save_database(&self) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::SaveDatabase { resp: tx })?;
         rx.await?
     }
 
@@ -1434,7 +1531,7 @@ impl IdaWorker {
             admission: admission.clone(),
             resp: tx,
         })?;
-        Self::recv_side_effect(rx, admission, timeout_secs).await
+        self.recv_side_effect(rx, admission, timeout_secs).await
     }
 
     /// Run a Python script via IDAPython and stream progress for foreground callers.
@@ -1498,7 +1595,10 @@ impl WorkerBackend {
     }
 
     pub(crate) fn uses_close_tokens(&self) -> bool {
-        matches!(self, Self::Local(_))
+        match self {
+            Self::Local(_) => false,
+            Self::Pooled(state) => state.uses_close_tokens(),
+        }
     }
 
     pub(crate) fn is_pooled(&self) -> bool {
@@ -1509,12 +1609,16 @@ impl WorkerBackend {
         matches!(self, Self::Pooled(PooledDatabaseBinding::Legacy(_)))
     }
 
-    pub(crate) fn issue_close_token_for_session(
+    pub(crate) async fn issue_close_token_for_session(
         &self,
         session_id: &str,
+        generation: Option<DatabaseGeneration>,
     ) -> Option<Result<CloseTokenGrant, String>> {
         match self {
-            Self::Local(worker) => Some(worker.issue_close_token_for_session(session_id)),
+            Self::Local(_) => None,
+            Self::Pooled(database) if database.uses_close_tokens() => {
+                database.issue_close_token(session_id, generation?).await
+            }
             Self::Pooled(_) => None,
         }
     }
@@ -1531,24 +1635,18 @@ impl WorkerBackend {
         }
     }
 
-    pub(crate) fn authorize_close(
+    pub(crate) async fn close_authorized(
         &self,
         session_id: &str,
         token: Option<&str>,
         force: bool,
-    ) -> CloseAuthorization {
+    ) -> Result<CloseAuthorization, ToolError> {
         match self {
-            Self::Local(worker) => worker.authorize_close(session_id, token, force),
-            // Pooled HTTP workers are private to one rmcp session, so close_idb
-            // cannot affect another client's database and does not need a
-            // cross-session recovery token.
-            Self::Pooled(_) => CloseAuthorization::Granted,
-        }
-    }
-
-    pub(crate) fn clear_close_token(&self) {
-        if let Self::Local(worker) = self {
-            worker.clear_close_token();
+            Self::Local(worker) => {
+                worker.close().await?;
+                Ok(CloseAuthorization::Granted)
+            }
+            Self::Pooled(database) => database.close_authorized(session_id, token, force).await,
         }
     }
 
@@ -1561,7 +1659,6 @@ impl WorkerBackend {
         debug_info_verbose: bool,
         force: bool,
         rebuild: bool,
-        file_type: Option<String>,
         auto_analyse: bool,
         raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
@@ -1577,7 +1674,6 @@ impl WorkerBackend {
             debug_info_verbose,
             force,
             rebuild,
-            file_type,
             auto_analyse,
             raw_target,
             extra_args,
@@ -1599,7 +1695,6 @@ impl WorkerBackend {
         debug_info_verbose: bool,
         force: bool,
         rebuild: bool,
-        file_type: Option<String>,
         auto_analyse: bool,
         raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
@@ -1618,7 +1713,6 @@ impl WorkerBackend {
                         debug_info_verbose,
                         force,
                         rebuild,
-                        file_type,
                         auto_analyse,
                         raw_target,
                         extra_args,
@@ -1638,7 +1732,6 @@ impl WorkerBackend {
                         debug_info_verbose,
                         force,
                         rebuild,
-                        file_type,
                         auto_analyse,
                         raw_target,
                         extra_args,
@@ -1850,6 +1943,116 @@ impl WorkerBackend {
         match self {
             Self::Local(worker) => worker.decompile(addr).await,
             Self::Pooled(state) => state.decompile(addr).await,
+        }
+    }
+
+    pub async fn list_lvars(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<ListLvarsResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .list_lvars(addr, name, offset, limit, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .list_lvars(addr, name, offset, limit, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn rename_lvar(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        selector: LocalVariableSelector,
+        new_name: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<RenameLvarResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .rename_lvar(addr, name, selector, new_name, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .rename_lvar(addr, name, selector, new_name, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn set_lvar_type(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        selector: LocalVariableSelector,
+        decl: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<SetLvarTypeResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .set_lvar_type(addr, name, selector, decl, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .set_lvar_type(addr, name, selector, decl, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn list_pseudocode_comments(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<ListPseudocodeCommentsResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .list_pseudocode_comments(addr, name, offset, limit, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .list_pseudocode_comments(addr, name, offset, limit, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn set_pseudocode_comment(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        locator: String,
+        comment: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<SetPseudocodeCommentResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .set_pseudocode_comment(addr, name, locator, comment, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .set_pseudocode_comment(addr, name, locator, comment, timeout_secs)
+                    .await
+            }
         }
     }
 
@@ -2528,6 +2731,13 @@ impl WorkerBackend {
         }
     }
 
+    pub async fn save_database(&self) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.save_database().await,
+            Self::Pooled(state) => state.save_database().await,
+        }
+    }
+
     pub async fn get_string(&self, addr: u64, max_len: usize) -> Result<Value, ToolError> {
         match self {
             Self::Local(worker) => worker.get_string(addr, max_len).await,
@@ -2640,7 +2850,7 @@ mod tests {
 
     use crate::error::ToolError;
     use crate::ida::request::{IdaRequest, SideEffectAdmission};
-    use crate::ida::worker::{CloseAuthorization, IdaWorker, WorkerBackend};
+    use crate::ida::worker::{CloseAuthorization, CloseTokenState, IdaWorker, WorkerBackend};
     use std::sync::mpsc;
 
     fn test_worker() -> IdaWorker {
@@ -2648,12 +2858,29 @@ mod tests {
         IdaWorker::new(tx)
     }
 
+    /// A supervised worker never times out on its own: the parent's watchdog
+    /// is the deadline, and answering early would hide a stuck IDA thread.
+    #[test]
+    fn supervised_worker_applies_no_deadline_of_its_own() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let supervised = IdaWorker::supervised(tx.clone());
+        let plain = IdaWorker::new(tx);
+        assert_eq!(
+            plain.clamped_timeout(Some(1)),
+            std::time::Duration::from_secs(1)
+        );
+        assert!(supervised.clamped_timeout(Some(1)) > std::time::Duration::from_secs(3600));
+        assert!(supervised.clamped_timeout(None) > std::time::Duration::from_secs(3600));
+    }
+
     #[tokio::test]
     async fn queued_side_effect_timeout_prevents_later_start() {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), ToolError>>();
         let admission = SideEffectAdmission::default();
 
-        let result = IdaWorker::recv_side_effect(rx, admission.clone(), Some(0)).await;
+        let result = test_worker()
+            .recv_side_effect(rx, admission.clone(), Some(0))
+            .await;
         assert!(matches!(result, Err(ToolError::Timeout(0))));
         assert!(
             admission.start().is_err(),
@@ -2672,7 +2899,8 @@ mod tests {
             let _ = tx.send(Ok::<_, ToolError>("settled"));
         });
 
-        let result = IdaWorker::recv_side_effect(rx, admission, Some(0))
+        let result = test_worker()
+            .recv_side_effect(rx, admission, Some(0))
             .await
             .expect("started mutation returns its real result");
         assert_eq!(result, "settled");
@@ -2685,7 +2913,9 @@ mod tests {
         let admission = SideEffectAdmission::default();
         let waiter_admission = admission.clone();
         let waiter = tokio::spawn(async move {
-            IdaWorker::recv_side_effect(rx, waiter_admission, Some(60)).await
+            test_worker()
+                .recv_side_effect(rx, waiter_admission, Some(60))
+                .await
         });
         tokio::task::yield_now().await;
         waiter.abort();
@@ -2754,12 +2984,12 @@ mod tests {
 
     #[test]
     fn close_token_is_reused_for_same_session() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         let first = worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
         let second = worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("same session should reuse token");
 
         assert_eq!(first.token, second.token);
@@ -2769,13 +2999,13 @@ mod tests {
 
     #[test]
     fn close_tokens_are_fresh_uuid_v4_bearer_capabilities() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         let first = worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
-        worker.clear_close_token();
+        let worker = CloseTokenState::default();
         let second = worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("second issue should succeed");
 
         assert_ne!(first.token, second.token);
@@ -2789,22 +3019,22 @@ mod tests {
 
     #[test]
     fn close_token_is_denied_for_different_session() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
 
         let denied = worker
-            .issue_close_token_for_session("session-b")
+            .issue_for_session("session-b")
             .expect_err("different session should be denied");
         assert_eq!(denied, "session-a");
     }
 
     #[test]
     fn owner_session_can_close_without_token() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
 
         assert_eq!(
@@ -2815,9 +3045,9 @@ mod tests {
 
     #[test]
     fn force_close_can_override_other_session() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
 
         assert_eq!(
@@ -2830,9 +3060,9 @@ mod tests {
 
     #[test]
     fn token_grants_close_from_any_session() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         let grant = worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
 
         assert_eq!(
@@ -2843,7 +3073,7 @@ mod tests {
 
     #[test]
     fn close_is_granted_when_no_lease_exists() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         assert_eq!(
             worker.authorize_close("session-x", None, false),
             CloseAuthorization::Granted

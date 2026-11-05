@@ -61,7 +61,6 @@ pub enum IdaRequest {
         debug_info_verbose: bool,
         force: bool,
         rebuild: bool,
-        file_type: Option<String>,
         auto_analyse: bool,
         raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
@@ -155,6 +154,44 @@ pub enum IdaRequest {
     Decompile {
         addr: u64,
         resp: oneshot::Sender<Result<String, ToolError>>,
+    },
+    ListLvars {
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        resp: oneshot::Sender<Result<ListLvarsResult, ToolError>>,
+    },
+    RenameLvar {
+        addr: Option<u64>,
+        name: Option<String>,
+        selector: LocalVariableSelector,
+        new_name: String,
+        admission: SideEffectAdmission,
+        resp: oneshot::Sender<Result<RenameLvarResult, ToolError>>,
+    },
+    SetLvarType {
+        addr: Option<u64>,
+        name: Option<String>,
+        selector: LocalVariableSelector,
+        decl: String,
+        admission: SideEffectAdmission,
+        resp: oneshot::Sender<Result<SetLvarTypeResult, ToolError>>,
+    },
+    ListPseudocodeComments {
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        resp: oneshot::Sender<Result<ListPseudocodeCommentsResult, ToolError>>,
+    },
+    SetPseudocodeComment {
+        addr: Option<u64>,
+        name: Option<String>,
+        locator: String,
+        comment: String,
+        admission: SideEffectAdmission,
+        resp: oneshot::Sender<Result<SetPseudocodeCommentResult, ToolError>>,
     },
     Segments {
         resp: oneshot::Sender<Result<Vec<SegmentInfo>, ToolError>>,
@@ -426,6 +463,9 @@ pub enum IdaRequest {
     ReadInt {
         addr: u64,
         size: usize,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    SaveDatabase {
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     GetString {

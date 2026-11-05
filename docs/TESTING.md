@@ -14,8 +14,14 @@ env DEBUGGER_REQUIRE_READY=1 just test-debugger-live # Authorized macOS live lif
 just test-tool-filter # Toolsets, explicit tools, exclusions, and read-only mode
 just test-script  # IDAPython script execution test
 just test-elicitation # open_idb auto-background elicitation test
+just test-universal # Universal (fat) Mach-O slice selection and prompts
 just test-session-cancel # legacy-session cancel-on-disconnect test
 just test-http-startup # HTTP bind-failure exit status (no IDA license needed)
+just test-stuck-call # Stuck-call retirement, immediate reopen, queued calls, orphans
+just test-lvars # Native Hex-Rays local edits, persistence, and read-only filtering
+just test-pseudocode-comments # Native pseudocode comment listing, edits, and persistence
+just test-message-limits # Oversized MCP frames preserve workers and unsaved edits
+just test-shutdown-signal # Signal/EOF shutdown saves, hung-close deadline, SIGKILL flush
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
 just cargo-test   # Unit tests (no IDA required)
 ```
@@ -67,6 +73,55 @@ builds the debug binary before running its harness.
   existing output
 - Covers `idb_out` beside read-only inputs, typed raw processor/bitness/base
   configuration, Thumb-tagged entry points, and failed-open cleanup
+
+**Universal Mach-O test** (`just test-universal`)
+- Builds 32- and 64-bit fat fixtures from `fixtures/mini` (arm64 plus an
+  arm64e-header copy); skips on hosts where the fixture is not arm64 Mach-O
+- Covers `arch` selection, slice-list errors, slice reuse, the thin-file arch
+  check, the legacy slice prompt (answered and timed out), and MCP 2026 input
+  requests, including one round that also answers the background question
+
+**Local-variable test** (`just test-lvars`)
+- Lists and pages real Hex-Rays locals, then renames and types one exact local
+- Rejects invalid names, missing or conflicting function selectors, and invalid or incompatible types without changing the local
+- Checks updated pseudocode and saved edits after reopening, on default stdio and `--workspace`
+- Confirms read-only mode keeps listing and rejects local edits
+
+**Pseudocode comment test** (`just test-pseudocode-comments`)
+- Lists and pages comment locations, including distinct `if` and `else` slots at one address
+- Rejects stale and wrong-function locators without changing any comment
+- Sets, replaces, and deletes comments, then checks the pseudocode after saving and reopening, on default stdio and `--workspace`
+
+**Message-limit test** (`just test-message-limits`)
+- Rejects an oversized private worker request before dispatch
+- Checks script-file size before decoding UTF-8
+- Returns a correlated tool error for an oversized worker reply
+- Bounds the final public reply including long client request IDs, even after a mutation ran
+- Requires a correlated rejection when an oversized public request's ID is recoverable
+- Discards oversized frames without a recoverable request ID, including notifications and responses, and resumes at the next line
+
+**Stuck-call test** (`just test-stuck-call`)
+- Reopens immediately after a stuck call retires the worker, with no sleep or
+  retry in between (`stdio_reopen.py`)
+- A `run_script` that never returns times out, its child is killed, no
+  database stays bound, and reopening on a fresh child keeps a saved rename
+- Calls queued behind a finite script time out or are cancelled without
+  touching the worker, its database, or Python state; calls past the queue
+  bound are rejected as busy
+- A read tool stuck inside IDA and a worker that exits inside a batch tool
+  both return top-level errors
+- Killing the parent with SIGKILL leaves no orphaned child, target-scoped
+  `RUST_LOG` reaches the child, and an unread stderr pipe cannot stop the
+  watchdog
+
+**Shutdown-signal test** (`just test-shutdown-signal`)
+- A departed client's unanswered elicitation prompt cannot delay saving the open database
+- Stdin EOF during foreground work waits for the operation and preserves an unsaved rename
+- SIGTERM and SIGHUP with stdin still open save an unsaved rename and exit,
+  on default stdio and with `--workspace`
+- With IDA's `closebase` hung, SIGTERM, SIGHUP, and stdin EOF still exit
+  within the close deadline and retire the child
+- After SIGKILL, finished auto-analysis is already on disk
 
 **Debugger availability test** (`just test-debugger`)
 - Confirms debugger tools are absent by default and stay hidden on unsupported hosts

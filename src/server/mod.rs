@@ -2,6 +2,7 @@
 
 pub mod http_access;
 pub mod http_config;
+mod instructions;
 mod operation;
 mod requests;
 pub mod task;
@@ -30,12 +31,13 @@ use rmcp::{
         wrapper::Parameters,
     },
     model::{
-        CallToolResult, ContentBlock as Content, ServerCapabilities, ServerInfo, Tool,
+        CallToolResult, ContentBlock as Content, ServerCapabilities, ServerConfig, Tool,
         ToolAnnotations,
     },
     schemars::{schema_for, JsonSchema},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::pin::Pin;
@@ -99,6 +101,10 @@ impl Default for ServerRuntimeState {
 impl ServerRuntimeState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn task_registry(&self) -> &task::TaskRegistry {
+        &self.task_registry
     }
 
     /// Runtime state for an HTTP transport started with `--stateless` (see
@@ -250,10 +256,7 @@ impl ToolMux<IdaMcpServer> {
         // tasks extension capability.
         let should_materialize_task = context.name() == "open_dsc"
             && context.service.workspace_registry.is_none()
-            && context
-                .request_context()
-                .protocol_version()
-                .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+            && speaks_mcp_2026(context.request_context())
             && context
                 .request_context()
                 .client_capabilities()
@@ -662,6 +665,277 @@ enum OpenIdbBackgroundDecision {
     InputRequired(InputRequiredResult),
 }
 
+/// Inputs shared by the questions `open_idb` may ask. A stage that answers
+/// from the MRTR fields takes them, so a later stage never sees a response
+/// meant for another.
+struct OpenPrompts {
+    request_state: Option<String>,
+    input_responses: Option<InputResponses>,
+    /// The call's parsed `timeout_secs`, which also bounds inline prompts.
+    timeout_secs: Option<u64>,
+    /// Whether a large input's auto-analysis may be offered as a background
+    /// task (see [`IdaMcpServer::background_prompt_applies`]).
+    background_prompt: bool,
+    /// Whether an MCP 2026 client declared it can show form input requests.
+    form_elicitation: bool,
+}
+
+/// A sealed MCP 2026 (MRTR) stage and the input-request key its question uses.
+struct MrtrStage {
+    seal: &'static [u8],
+    key: &'static str,
+}
+
+const BACKGROUND_STAGE: MrtrStage = MrtrStage {
+    seal: b"open_idb/background-confirmation/v1",
+    key: "background",
+};
+const SLICE_STAGE: MrtrStage = MrtrStage {
+    seal: b"open_idb/universal-slice/v1",
+    key: "slice",
+};
+
+/// One MCP 2026 form stage: asked now, answered on the retry, or impossible
+/// because the client cannot show forms.
+enum MrtrStep {
+    InputRequired(InputRequiredResult),
+    Answered(ElicitResult),
+    NoFormSupport,
+}
+
+/// A universal Mach-O input resolved to the slice file IDA will open.
+#[derive(serde::Serialize)]
+struct UniversalSlice {
+    arch: String,
+    slices: Vec<String>,
+    slice_path: String,
+    /// Background answer collected in the slice prompt, when it asked one.
+    #[serde(skip)]
+    background: Option<bool>,
+}
+
+enum UniversalInput {
+    /// Not a universal Mach-O; open the path as given.
+    NotUniversal,
+    Resolved(UniversalSlice),
+    InputRequired(InputRequiredResult),
+    Rejected(ToolError),
+}
+
+enum SliceAnswer {
+    Chosen(crate::macho_fat::FatSlice, Option<bool>),
+    InputRequired(InputRequiredResult),
+    /// No usable answer; the reason completes "…; <reason>. Pass arch=…".
+    Unanswered(String),
+}
+
+const NO_FORM_SUPPORT: &str = "the client cannot show input requests";
+
+fn speaks_mcp_2026(ctx: &RequestContext<RoleServer>) -> bool {
+    ctx.protocol_version()
+        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+}
+
+fn client_supports_form_elicitation(ctx: &RequestContext<RoleServer>) -> bool {
+    ctx.client_capabilities()
+        .and_then(|capabilities| capabilities.elicitation)
+        .and_then(|elicitation| elicitation.form)
+        .is_some()
+}
+
+fn exceeds_background_threshold(size_bytes: u64) -> bool {
+    size_bytes > OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES
+}
+
+/// The background question's schema, shared by every prompt that asks it so
+/// the protocols cannot drift.
+fn background_choice_schema() -> Result<ElicitationSchema, McpError> {
+    ElicitationSchema::from_type::<OpenIdbBackgroundChoice>().map_err(|error| {
+        McpError::internal_error(
+            format!("failed to build open_idb elicitation schema: {error}"),
+            None,
+        )
+    })
+}
+
+/// An accepted background answer; no content or no choice means background.
+fn accepted_background(content: Option<Value>) -> bool {
+    content
+        .and_then(|content| serde_json::from_value::<OpenIdbBackgroundChoice>(content).ok())
+        .and_then(|choice| choice.background)
+        .unwrap_or(true)
+}
+
+fn slice_required_error(
+    path: &str,
+    slices: &[crate::macho_fat::FatSlice],
+    reason: &str,
+) -> ToolError {
+    ToolError::InvalidParams(format!(
+        "{path} is a universal Mach-O with slices {}; {reason}. Pass arch=<slice> to choose one.",
+        crate::macho_fat::slice_names(slices)
+    ))
+}
+
+/// Build the slice prompt. It also carries the background question when the
+/// chosen slice could cross the auto-background threshold, so one round trip
+/// answers both and MCP 2026 needs no chained request state.
+fn universal_slice_form(
+    path: &str,
+    slices: &[crate::macho_fat::FatSlice],
+    ask_background: bool,
+) -> Result<ElicitRequestParams, McpError> {
+    let names = slices.iter().map(|slice| slice.arch.clone()).collect();
+    let titles = slices
+        .iter()
+        .enumerate()
+        .map(|(index, slice)| {
+            format!(
+                "{} (slice {}, {} KiB)",
+                slice.arch,
+                index + 1,
+                slice.size.div_ceil(1024)
+            )
+        })
+        .collect();
+    let arch = EnumSchema::builder(names)
+        .enum_titles(titles)
+        .map_err(|error| McpError::internal_error(error, None))?
+        .description("Architecture slice to analyze")
+        .build();
+    let mut builder = ElicitationSchema::builder().required_enum_schema("arch", arch);
+    let mut message = format!(
+        "'{path}' is a universal Mach-O with {} slices ({}). Which architecture should IDA analyze?",
+        slices.len(),
+        crate::macho_fat::slice_names(slices)
+    );
+    if ask_background {
+        let background = background_choice_schema()?
+            .properties
+            .remove("background")
+            .ok_or_else(|| {
+                McpError::internal_error("background choice schema lost its field", None)
+            })?;
+        builder = builder.property("background", background);
+        message.push_str(&format!(
+            " Slices over {} MiB can run auto-analysis as a background task.",
+            OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES / (1024 * 1024)
+        ));
+    }
+    let requested_schema = builder
+        .build()
+        .map_err(|error| McpError::internal_error(error, None))?;
+    Ok(ElicitRequestParams::FormElicitationParams {
+        meta: None,
+        message,
+        requested_schema,
+    })
+}
+
+/// The slice (and background answer, when asked) from a slice prompt answer.
+fn slice_answer_from(
+    response: ElicitResult,
+    slices: &[crate::macho_fat::FatSlice],
+    ask_background: bool,
+) -> Result<(crate::macho_fat::FatSlice, Option<bool>), String> {
+    match response.action {
+        ElicitationAction::Accept => {
+            let content = response.content.unwrap_or(Value::Null);
+            let arch = content
+                .get("arch")
+                .and_then(Value::as_str)
+                .ok_or("the answer did not name a slice")?;
+            let slice = crate::macho_fat::select_slice(slices, arch)
+                .ok_or_else(|| format!("no {arch} slice"))?;
+            Ok((
+                slice.clone(),
+                ask_background.then(|| accepted_background(Some(content))),
+            ))
+        }
+        ElicitationAction::Decline | ElicitationAction::Cancel => {
+            Err("the slice prompt was declined".to_string())
+        }
+        // `ElicitationAction` is #[non_exhaustive]; never guess a slice.
+        _ => Err("the slice prompt was not accepted".to_string()),
+    }
+}
+
+/// Slices of a universal Mach-O `input`, or `None` for any other input. An
+/// `arch` that cannot apply to a non-universal input is rejected.
+fn universal_slices(
+    input: &std::path::Path,
+    path: &str,
+    arch: Option<&str>,
+) -> Result<Option<Vec<crate::macho_fat::FatSlice>>, ToolError> {
+    use crate::macho_fat::MachOKind;
+
+    match crate::macho_fat::inspect(input)? {
+        MachOKind::Universal(slices) => Ok(Some(slices)),
+        MachOKind::Thin(thin) => match arch {
+            Some(arch) if !arch.eq_ignore_ascii_case(&thin) => {
+                Err(ToolError::InvalidParams(format!(
+                    "{path} is a single-architecture {thin} Mach-O; arch={arch} does not match"
+                )))
+            }
+            Some(_) | None => Ok(None),
+        },
+        MachOKind::Other => match arch {
+            Some(_) => Err(ToolError::InvalidParams(format!(
+                "arch applies only to Mach-O inputs; {path} is not a Mach-O file"
+            ))),
+            None => Ok(None),
+        },
+    }
+}
+
+/// Copy `slice` of `input` to its slice file beside the output database.
+async fn extract_universal_slice(
+    input: &std::path::Path,
+    idb_out: Option<&str>,
+    slice: &crate::macho_fat::FatSlice,
+) -> Result<std::path::PathBuf, ToolError> {
+    let output = idb_out.map(crate::expand_path);
+    let dest = crate::macho_fat::slice_path(input, output.as_deref(), &slice.arch)
+        .ok_or_else(|| ToolError::InvalidPath(input.display().to_string()))?;
+    if output.as_deref().is_some_and(|output| {
+        crate::ida::handlers::database::paths_refer_to_same_file(output, &dest)
+    }) {
+        return Err(ToolError::InvalidParams(format!(
+            "idb_out {} would overwrite the extracted {} slice",
+            dest.display(),
+            slice.arch
+        )));
+    }
+    let (source, chosen, target) = (input.to_path_buf(), slice.clone(), dest.clone());
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::macho_fat::extract_slice(&source, &chosen, &target)
+    })
+    .await
+    .map_err(|error| {
+        ToolError::OpenFailed(format!(
+            "extracting the {} slice of {} failed: {error}",
+            slice.arch,
+            input.display()
+        ))
+    })??;
+    info!(
+        input = %input.display(),
+        arch = %slice.arch,
+        slice_path = %dest.display(),
+        ?outcome,
+        "Resolved universal Mach-O slice"
+    );
+    Ok(dest)
+}
+
+/// How long the parent's own foreground timer waits beyond the pool's kill
+/// point before giving up on the typed retirement error.
+const FOREGROUND_SUPERVISOR_MARGIN_SECS: u64 = 3;
+/// Largest foreground deadline: the largest request plus the pool's grace and
+/// the supervisor margin, so a maximum request still ends with the typed error.
+const FOREGROUND_MAX_SECS: u64 =
+    MAX_TIMEOUT_SECS + CHILD_TIMEOUT_GRACE_SECS + FOREGROUND_SUPERVISOR_MARGIN_SECS;
+
 fn timeout_with_child_grace(timeout_secs: Option<u64>, default_timeout_secs: u64) -> u64 {
     timeout_secs
         .unwrap_or(default_timeout_secs)
@@ -815,15 +1089,24 @@ impl IdaMcpServer {
     }
 
     fn close_hint(&self) -> &'static str {
-        close_hint_for(self.mode, self.worker.is_pooled(), self.workspace_enabled())
+        close_hint_for(
+            self.mode,
+            self.worker.is_legacy_pooled(),
+            self.workspace_enabled(),
+        )
     }
 
-    fn http_close_grant(&self) -> Option<Result<CloseTokenGrant, String>> {
+    async fn http_close_grant(
+        &self,
+        generation: Option<DatabaseGeneration>,
+    ) -> Option<Result<CloseTokenGrant, String>> {
         if !self.workspace_enabled()
             && matches!(self.mode, ServerMode::Http)
             && self.worker.uses_close_tokens()
         {
-            self.worker.issue_close_token_for_session(&self.session_id)
+            self.worker
+                .issue_close_token_for_session(&self.session_id, generation)
+                .await
         } else {
             None
         }
@@ -838,36 +1121,7 @@ impl IdaMcpServer {
     }
 
     fn instructions(&self) -> String {
-        format!(
-            "IDA Pro headless analysis server for reverse engineering binaries. \
-                 \n\nWorkflow: \
-                 \n1. open_idb: Open a .i64/.idb file or a raw binary (Mach-O/ELF/PE). Large DBs may take 30+ seconds. \
-                 \n   load_debug_info: Optional for existing .i64 to load DWARF/dSYM \
-                 \n2. tool_catalog: Discover tools for your task (e.g., 'find callers', 'decompile') \
-                 \n3. tool_help: Get full docs for a specific tool \
-                 \n4. Use the discovered tools to analyze the binary \
-                 \n5. close_idb: Optionally close when done \
-                 \n\nNote: tools/list exposes the full tool set by default; use tool_catalog/tool_help to discover usage. \
-                 \n{close_hint} \
-                 \n\nTool Categories: \
-                 \n- core: open/close/discover (open_idb, close_idb, tool_catalog, tool_help, recent_operations, idb_meta) \
-                 \n- functions: list, resolve, lookup functions \
-                 \n- disassembly: disasm at addresses \
-                 \n- decompile: Hex-Rays pseudocode \
-                 \n- xrefs: cross-reference analysis \
-                 \n- control_flow: CFG, callgraph, paths \
-                 \n- memory: read bytes, strings, values \
-                 \n- search: find patterns, strings \
-                 \n- metadata: segments, imports, exports, Lumina lookup \
-                 \n- types: declare_type, apply_types (addr/stack), infer_types, local_types, stack_frame, declare_stack, delete_stack, structs (list/info/read) \
-                \n- editing: comments/rename/patch/patch_asm/Lumina apply \
-                 \n- scripting: run_script (execute IDAPython code) \
-                 \n\nTip: Use tool_catalog(query='what you want to do') to find the right tool. \
-                 \nTip: If xrefs/decompile look incomplete, call analysis_status to check auto-analysis. \
-                 \nTip: After a timeout or cancellation, call recent_operations to inspect the last recorded foreground phase. \
-                 \nTip: After dsc_add_dylib or dsc_add_region, call analysis_status; if auto_is_ok=false, run analyze_funcs before xrefs/decompile.",
-            close_hint = self.close_hint()
-        )
+        instructions::build(&self.filter, self.close_hint())
     }
 
     fn validate_path(path: &str) -> bool {
@@ -899,17 +1153,39 @@ impl IdaMcpServer {
     }
 
     fn parse_address(s: &str) -> Result<u64, ToolError> {
-        let mut s = s.trim().to_string();
-        s.retain(|c| c != '_');
-        if s.starts_with("0x") || s.starts_with("0X") {
-            u64::from_str_radix(&s[2..], 16).map_err(|_| ToolError::InvalidAddress(s))
-        } else if s.starts_with("0b") || s.starts_with("0B") {
-            u64::from_str_radix(&s[2..], 2).map_err(|_| ToolError::InvalidAddress(s))
-        } else if s.starts_with("0o") || s.starts_with("0O") {
-            u64::from_str_radix(&s[2..], 8).map_err(|_| ToolError::InvalidAddress(s))
+        let original = s.trim();
+        // Underscores are digit separators (0x1000_0000); they are removed
+        // for parsing but the error echoes what the caller sent.
+        let digits: String = original.chars().filter(|c| *c != '_').collect();
+        let parsed = if let Some(hex) = digits.strip_prefix("0x").or(digits.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16)
+        } else if let Some(bin) = digits.strip_prefix("0b").or(digits.strip_prefix("0B")) {
+            u64::from_str_radix(bin, 2)
+        } else if let Some(oct) = digits.strip_prefix("0o").or(digits.strip_prefix("0O")) {
+            u64::from_str_radix(oct, 8)
         } else {
-            s.parse()
-                .map_err(|_| ToolError::InvalidAddress(s.to_string()))
+            digits.parse()
+        };
+        parsed.map_err(|_| ToolError::InvalidAddress(Self::describe_bad_address(original)))
+    }
+
+    /// A symbol passed where an address was expected is the common mistake;
+    /// say so instead of echoing a string the model cannot act on.
+    fn describe_bad_address(original: &str) -> String {
+        let looks_like_symbol = original
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && !original.starts_with("0x")
+            && !original.starts_with("0X");
+        if looks_like_symbol {
+            format!(
+                "{original:?} is a symbol name, not an address; pass a hex address such as \
+                 0x100000660, or give the name to a tool's target_name/name parameter, or \
+                 resolve it first with resolve_function"
+            )
+        } else {
+            format!("{original:?} is not a hex (0x...), decimal, octal (0o...), or binary (0b...) address")
         }
     }
 
@@ -979,23 +1255,45 @@ impl IdaMcpServer {
         strings.iter().map(|s| Self::parse_address(s)).collect()
     }
 
-    fn value_to_single_address(value: &Value) -> Result<u64, ToolError> {
-        let addrs = Self::value_to_addresses(value)?;
-        addrs
-            .into_iter()
-            .next()
-            .ok_or_else(|| ToolError::InvalidAddress("empty address list".to_string()))
+    /// The address selector of a mutating tool, after checking the caller
+    /// named exactly one target: one address or one non-empty name.
+    fn mutation_target_address(
+        address: Option<&Value>,
+        name: Option<&str>,
+        name_field: &str,
+    ) -> Result<Option<u64>, ToolError> {
+        match (address, name) {
+            (Some(_), Some(_)) => Err(ToolError::InvalidParams(format!(
+                "pass either address or {name_field} for the target, not both"
+            ))),
+            (None, None) => Err(ToolError::InvalidParams(format!(
+                "pass address or {name_field} for the target"
+            ))),
+            (Some(value), None) => Self::value_to_exactly_one_address(value, "address").map(Some),
+            (None, Some("")) => Err(ToolError::InvalidParams(format!(
+                "{name_field} must not be empty"
+            ))),
+            (None, Some(_)) => Ok(None),
+        }
     }
 
+    /// For tools that return one result: a scalar or a one-element array is
+    /// accepted, anything else is refused rather than silently truncated.
     fn value_to_exactly_one_address(value: &Value, field_name: &str) -> Result<u64, ToolError> {
         let addresses = Self::value_to_addresses(value)?;
         match addresses.as_slice() {
             [address] => Ok(*address),
-            _ => Err(ToolError::InvalidParams(format!(
-                "{field_name} must contain exactly one value"
+            many => Err(ToolError::InvalidParams(format!(
+                "{field_name} must contain exactly one address, got {}; this tool handles one \
+                 address per call",
+                many.len()
             ))),
         }
     }
+
+    /// Foreground bound used inside a child worker: effectively none, because
+    /// the supervising parent enforces the real deadline and retires the child.
+    const WORKER_UNBOUNDED_SECS: u64 = 60 * 60 * 24 * 365;
 
     /// Default page size for xref listings when the caller omits `limit`.
     const DEFAULT_XREFS_LIMIT: usize = 1000;
@@ -1033,14 +1331,6 @@ impl IdaMcpServer {
 
     /// Wrap a per-address xref result for the multi-address response, injecting
     /// the queried address into the serialized listing.
-    fn xrefs_entry(addr: u64, result: crate::ida::types::XRefListResult) -> Value {
-        let mut entry = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
-        if let Value::Object(map) = &mut entry {
-            map.insert("address".to_string(), json!(format!("{:#x}", addr)));
-        }
-        entry
-    }
-
     /// Fetch one paginated xref listing in the given direction.
     async fn xrefs_for(
         &self,
@@ -1085,30 +1375,26 @@ impl IdaMcpServer {
                 .xrefs_for(addrs[0], offset, limit, timeout_secs, direction)
                 .await
             {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
+                Ok(result) => Ok(typed_result(&XrefsOutput::Single(result))),
                 Err(e) => Ok(e.to_tool_result()),
             }
         } else {
             let mut results = Vec::new();
             for addr in addrs {
+                let address = format!("{addr:#x}");
                 match self
                     .xrefs_for(addr, offset, limit, timeout_secs, direction)
                     .await
                 {
-                    Ok(result) => results.push(Self::xrefs_entry(addr, result)),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
+                    Ok(listing) => results.push(XrefsBatchEntry::Listing { address, listing }),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
+                    Err(e) => results.push(XrefsBatchEntry::Error {
+                        address,
+                        error: e.to_string(),
+                    }),
                 }
             }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
+            Ok(typed_result(&XrefsOutput::Batch { results }))
         }
     }
 
@@ -1205,10 +1491,15 @@ impl IdaMcpServer {
         next_operation_id(self.operation_nonce.as_ref())
     }
 
+    /// Let a timed-out or cancelled operation settle briefly. If it settles
+    /// with a fatal error (the supervisor retired the worker), that error is
+    /// returned so the client learns the database is gone, instead of the
+    /// generic timeout that would hide it.
     async fn finish_cancelled_foreground<T, Fut>(
         tool_name: &'static str,
         operation_fut: Pin<&mut Fut>,
-    ) where
+    ) -> Option<ToolError>
+    where
         Fut: std::future::Future<Output = Result<T, ToolError>>,
     {
         let cleanup = tokio::time::timeout(
@@ -1216,12 +1507,17 @@ impl IdaMcpServer {
             operation_fut,
         )
         .await;
-        if cleanup.is_err() {
-            warn!(
-                tool_name,
-                timeout_secs = FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS,
-                "foreground operation did not finish cancellation cleanup before response"
-            );
+        match cleanup {
+            Ok(Err(error)) if error.is_fatal() => Some(error),
+            Ok(_) => None,
+            Err(_) => {
+                warn!(
+                    tool_name,
+                    timeout_secs = FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS,
+                    "foreground operation did not finish cancellation cleanup before response"
+                );
+                None
+            }
         }
     }
 
@@ -1231,7 +1527,12 @@ impl IdaMcpServer {
         default_timeout_secs: u64,
     ) -> Option<u64> {
         if self.worker.is_pooled() {
-            return Some(timeout_with_child_grace(timeout_secs, default_timeout_secs));
+            // Past the pool's kill point, so the supervisor's typed
+            // retirement error is what the client gets, not a generic timeout.
+            return Some(
+                timeout_with_child_grace(timeout_secs, default_timeout_secs)
+                    .saturating_add(FOREGROUND_SUPERVISOR_MARGIN_SECS),
+            );
         }
         timeout_secs
     }
@@ -1265,19 +1566,46 @@ impl IdaMcpServer {
         // response when fast tools coalesce into a single Node stdin `data`
         // event, dropping the Claude Code transport with "unknown progress
         // token". Phases remain observable via `recent_operations`.
+        // The drain cannot wait for every sender to drop: an IDA SDK crash
+        // unwinds with siglongjmp, which skips the destructor of a handler's
+        // heartbeat and leaves its sender alive. The finished operation ends
+        // the drain instead.
+        let operation_finished = tokio_util::sync::CancellationToken::new();
         let drain_task = tokio::spawn({
             let registry = self.operation_registry.clone();
             let op_id = op_id.clone();
+            let operation_finished = operation_finished.clone();
             async move {
-                while let Some(update) = progress_rx.recv().await {
-                    registry.record_progress(&op_id, update.phase, update.message);
+                loop {
+                    tokio::select! {
+                        biased;
+                        update = progress_rx.recv() => {
+                            let Some(update) = update else { break };
+                            registry.record_progress(&op_id, update.phase, update.message);
+                        }
+                        () = operation_finished.cancelled() => {
+                            while let Ok(update) = progress_rx.try_recv() {
+                                registry.record_progress(&op_id, update.phase, update.message);
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         });
         let worker_cancel = tokio_util::sync::CancellationToken::new();
-        let timeout = timeout_secs
-            .unwrap_or(default_timeout_secs)
-            .min(MAX_TIMEOUT_SECS);
+        // A child worker cannot interrupt a native IDA call, so its own
+        // timeout would only answer early while its IDA thread stays stuck;
+        // the parent is the watchdog and kills the child at its bound.
+        // A router's deadline includes the pool's grace and a margin above
+        // MAX_TIMEOUT_SECS (see foreground_timeout_secs); clamping it back
+        // would let this timer beat the supervisor at the maximum request.
+        let timeout = match self.mode {
+            ServerMode::Worker => Self::WORKER_UNBOUNDED_SECS,
+            ServerMode::Stdio | ServerMode::Http => timeout_secs
+                .unwrap_or(default_timeout_secs)
+                .min(FOREGROUND_MAX_SECS),
+        };
         let client_cancel = ctx.ct.clone();
 
         let operation_fut = run(progress_tx, worker_cancel.clone());
@@ -1298,6 +1626,7 @@ impl IdaMcpServer {
 
         match outcome {
             Outcome::Finished(result) => {
+                operation_finished.cancel();
                 let _ = drain_task.await;
                 match result {
                     Ok(value) => {
@@ -1334,9 +1663,16 @@ impl IdaMcpServer {
                 }
             }
             Outcome::TimedOut(timeout_secs) => {
-                Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
+                let fatal =
+                    Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
                 drain_task.abort();
                 let _ = drain_task.await;
+                if let Some(error) = fatal {
+                    let _ = self
+                        .operation_registry
+                        .finish_failed(&op_id, format!("{tool_name} failed: {error}"));
+                    return Err(ForegroundOperationError::Tool(error));
+                }
                 let snapshot = self
                     .operation_registry
                     .finish_timed_out(
@@ -1359,9 +1695,16 @@ impl IdaMcpServer {
                 })
             }
             Outcome::Cancelled => {
-                Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
+                let fatal =
+                    Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
                 drain_task.abort();
                 let _ = drain_task.await;
+                if let Some(error) = fatal {
+                    let _ = self
+                        .operation_registry
+                        .finish_failed(&op_id, format!("{tool_name} failed: {error}"));
+                    return Err(ForegroundOperationError::Tool(error));
+                }
                 let snapshot = self
                     .operation_registry
                     .finish_cancelled(&op_id, format!("{tool_name} cancelled by client"))
@@ -1512,11 +1855,10 @@ impl IdaMcpServer {
     async fn open_dsc_direct(
         &self,
         open_path: &std::path::Path,
-        file_type: Option<&str>,
         module: &str,
         frameworks: &[String],
     ) -> Result<CallToolResult, McpError> {
-        info!(path = %open_path.display(), file_type, "Opening DSC directly through idalib");
+        info!(path = %open_path.display(), "Opening DSC directly through idalib");
 
         let open_path_str = open_path.display().to_string();
         // Bind the image loads below to the database this call opened. The IDA
@@ -1532,7 +1874,6 @@ impl IdaMcpServer {
                 false,
                 false,
                 false,
-                file_type.map(str::to_string),
                 false,
                 RawBinaryTarget::default(),
                 Vec::new(),
@@ -1556,7 +1897,7 @@ impl IdaMcpServer {
             .await
         {
             Ok(image) => loaded_images.push(image),
-            Err(ToolError::NotSupported(message)) if file_type.is_none() => {
+            Err(ToolError::NotSupported(message)) => {
                 dsc_warning = Some(format!(
                     "Opened existing IDA database, but native DSC loading is unavailable: {message}"
                 ));
@@ -1578,6 +1919,7 @@ impl IdaMcpServer {
 
         let analysis_status = match self.worker.analysis_status_for_generation(generation).await {
             Ok(status) => Some(status),
+            Err(err) if err.is_fatal() => return Ok(err.to_tool_result()),
             Err(err) => {
                 warn!(module = %module, error = %err, "failed to fetch analysis_status after open_dsc");
                 None
@@ -1591,7 +1933,7 @@ impl IdaMcpServer {
         };
         let next_steps = dsc_analysis_next_steps(analysis_ready, next_step_hint);
 
-        let close_token = self.http_close_grant();
+        let close_token = self.http_close_grant(generation).await;
 
         let mut value = match serde_json::to_value(&db_info) {
             Ok(v) => v,
@@ -1639,6 +1981,12 @@ impl IdaMcpServer {
         cancel_token: &tokio_util::sync::CancellationToken,
         cancel_message: &str,
     ) -> task::TaskSettlement {
+        if error.is_fatal() {
+            return registry.complete_after_fatal_error(
+                task_id,
+                call_tool_result_to_value(&error.to_tool_result()),
+            );
+        }
         registry.complete_with_cancel_token(
             task_id,
             call_tool_result_to_value(&error.to_tool_result()),
@@ -1880,7 +2228,6 @@ impl IdaMcpServer {
                 false,
                 false,
                 false,
-                None,
                 auto_analyse,
                 RawBinaryTarget::default(),
                 Vec::new(),
@@ -1928,6 +2275,18 @@ impl IdaMcpServer {
             let module_result = worker
                 .dsc_load_image_for_generation(&module, Some(600), Some(database_generation))
                 .await;
+            if let Err(error) = &module_result
+                && error.is_fatal()
+            {
+                Self::complete_background_tool_error(
+                    &task_id,
+                    &registry,
+                    error,
+                    &cancel_token,
+                    "Cancelled after the worker was lost",
+                );
+                return;
+            }
             if cancel_token.is_cancelled() {
                 Self::finish_dsc_cancellation_after_open(
                     &task_id,
@@ -1969,6 +2328,18 @@ impl IdaMcpServer {
                 let framework_result = worker
                     .dsc_load_image_for_generation(framework, Some(600), Some(database_generation))
                     .await;
+                if let Err(error) = &framework_result
+                    && error.is_fatal()
+                {
+                    Self::complete_background_tool_error(
+                        &task_id,
+                        &registry,
+                        error,
+                        &cancel_token,
+                        "Cancelled after the worker was lost",
+                    );
+                    return;
+                }
                 if cancel_token.is_cancelled() {
                     Self::finish_dsc_cancellation_after_open(
                         &task_id,
@@ -2001,6 +2372,20 @@ impl IdaMcpServer {
             let analysis_status_result = worker
                 .analysis_status_for_generation(Some(database_generation))
                 .await;
+            if let Err(error) = &analysis_status_result
+                && error.is_fatal()
+            {
+                // The worker already discarded the database; there is
+                // nothing left to close, even when cancellation is pending.
+                Self::complete_background_tool_error(
+                    &task_id,
+                    &registry,
+                    error,
+                    &cancel_token,
+                    "Cancelled after the worker was lost",
+                );
+                return;
+            }
             if cancel_token.is_cancelled() {
                 Self::finish_dsc_cancellation_after_open(
                     &task_id,
@@ -2038,7 +2423,9 @@ impl IdaMcpServer {
 
         let close_token = match (mode, owner_session_id.as_deref()) {
             (ServerMode::Http, Some(owner_session_id)) => {
-                worker.issue_close_token_for_session(owner_session_id)
+                worker
+                    .issue_close_token_for_session(owner_session_id, Some(database_generation))
+                    .await
             }
             _ => None,
         };
@@ -2066,7 +2453,11 @@ impl IdaMcpServer {
             apply_close_metadata(
                 map,
                 close_token,
-                close_hint_for(mode, worker.is_pooled(), workspace_database_id.is_some()),
+                close_hint_for(
+                    mode,
+                    worker.is_legacy_pooled(),
+                    workspace_database_id.is_some(),
+                ),
             );
         }
 
@@ -2500,6 +2891,8 @@ impl IdaMcpServer {
         Raw binaries default to a .i64 alongside the input; idb_out selects another output path. \
         Later raw-path opens reuse only a database whose recorded input SHA-256 matches. \
         rebuild=true may replace only a provenance-matched database. \
+        Universal (fat) Mach-O: pass arch (e.g. arm64e) or answer the slice prompt; \
+        the slice is extracted to <input>.<arch> and opened. \
         For raw binaries, auto-analysis is OFF by default — check analysis_status; \
         call analyze_funcs(background=true) for full xrefs/decompile. \
         Returns close_token in HTTP/SSE mode (provide to close_idb). \
@@ -2528,7 +2921,6 @@ impl IdaMcpServer {
 
         let input_is_database = Self::is_database_path(&path);
         let debug_info_path = req.normalized_debug_info_path();
-        let file_type = req.normalized_file_type();
         let processor = req.normalized_processor();
         if let Some(processor) = processor.as_deref()
             && let Err(error) = validate_raw_processor(processor)
@@ -2584,14 +2976,43 @@ impl IdaMcpServer {
             base_address,
             entry_point,
         };
-        if input_is_database && (idb_out.is_some() || !raw_target.is_empty()) {
+        if input_is_database
+            && (idb_out.is_some() || !raw_target.is_empty() || req.normalized_arch().is_some())
+        {
             return Ok(ToolError::InvalidParams(
-                "processor, bitness, base_address, entry_point, and idb_out are only valid when opening a raw input"
+                "processor, bitness, base_address, entry_point, arch, and idb_out are only valid when opening a raw input"
                     .to_string(),
             )
             .to_tool_result()
             .into());
         }
+        let user_auto_analyse = req.auto_analyse.unwrap_or(false);
+        let mut prompts = OpenPrompts {
+            request_state,
+            input_responses,
+            timeout_secs,
+            background_prompt: self.background_prompt_applies(user_auto_analyse),
+            form_elicitation: client_supports_form_elicitation(&ctx),
+        };
+        // A pooled worker opens exactly the path its parent resolved; it has
+        // no client to ask which slice to use.
+        let universal = if input_is_database || matches!(self.mode, ServerMode::Worker) {
+            None
+        } else {
+            let arch = req.normalized_arch();
+            match self
+                .resolve_universal_input(&ctx, &path, arch, idb_out.as_deref(), &mut prompts)
+                .await?
+            {
+                UniversalInput::NotUniversal => None,
+                UniversalInput::Resolved(slice) => Some(slice),
+                UniversalInput::InputRequired(result) => return Ok(result.into()),
+                UniversalInput::Rejected(error) => return Ok(error.to_tool_result().into()),
+            }
+        };
+        let path = universal
+            .as_ref()
+            .map_or(path, |slice| slice.slice_path.clone());
         if !raw_target.is_empty()
             && !req.rebuild.unwrap_or(false)
             && raw_blob_database_exists(&path, idb_out.as_deref())
@@ -2610,37 +3031,28 @@ impl IdaMcpServer {
         };
         let open_timeout_secs = timeout_secs.unwrap_or(300).min(MAX_TIMEOUT_SECS);
         let foreground_timeout_secs = self.foreground_timeout_secs(timeout_secs, 300);
-        let user_auto_analyse = req.auto_analyse.unwrap_or(false);
-        let large_input_size = if !matches!(self.mode, ServerMode::Worker)
-            && user_auto_analyse
-            && !input_is_database
-        {
+        let large_input_size = if prompts.background_prompt && !input_is_database {
             Self::input_size_above_threshold(&path)
         } else {
             None
         };
-        let route_to_background = match large_input_size {
-            Some(size) => match self
-                .choose_open_idb_background(
-                    &ctx,
-                    &path,
-                    size,
-                    timeout_secs,
-                    request_state,
-                    input_responses,
-                )
+        let answered_background = universal.as_ref().and_then(|slice| slice.background);
+        let route_to_background = match (large_input_size, answered_background) {
+            (Some(_), Some(background)) => background,
+            (Some(size), None) => match self
+                .choose_open_idb_background(&ctx, &path, size, &mut prompts)
                 .await?
             {
                 OpenIdbBackgroundDecision::Ready(background) => background,
                 OpenIdbBackgroundDecision::InputRequired(result) => return Ok(result.into()),
             },
-            None if request_state.is_some() || input_responses.is_some() => {
+            (None, _) if prompts.request_state.is_some() || prompts.input_responses.is_some() => {
                 return Err(McpError::invalid_params(
                     "requestState/inputResponses do not match an active open_idb elicitation",
                     None,
                 ));
             }
-            None => false,
+            (None, _) => false,
         };
         // Open the database with auto_analyse disabled when we plan to spawn
         // analysis as a background task; the open call itself stays fast and
@@ -2655,14 +3067,13 @@ impl IdaMcpServer {
                 foreground_timeout_secs,
                 300,
                 |progress_tx, cancel| {
-                    self.worker.open_observed(
+                    self.worker.open_observed_with_generation(
                         &path,
                         req.load_debug_info.unwrap_or(false),
                         debug_info_path.clone(),
                         req.debug_info_verbose.unwrap_or(false),
                         req.force.unwrap_or(false),
                         req.rebuild.unwrap_or(false),
-                        file_type.clone(),
                         effective_auto_analyse,
                         raw_target.clone(),
                         worker_extra_args.clone(),
@@ -2675,8 +3086,9 @@ impl IdaMcpServer {
             )
             .await
         {
-            Ok(info) => {
-                let close_token = self.http_close_grant();
+            Ok(opened) => {
+                let close_token = self.http_close_grant(Some(opened.generation)).await;
+                let info = opened.info;
                 let analysis_task = if route_to_background && !info.analysis_status.auto_is_ok {
                     let cancel_token = self.background_lifetime(&ctx.meta).child_token();
                     let owner = self.task_owner(&ctx.meta);
@@ -2712,7 +3124,13 @@ impl IdaMcpServer {
                     if info.analysis_status.auto_is_ok {
                         quick_tools.extend(["decompile", "xrefs_to"]);
                     }
+                    // Only recommend what this (public) server advertises; a
+                    // child worker's own filter is always unrestricted.
+                    quick_tools.retain(|name| self.filter.is_enabled(name));
                     map.insert("quick_tools".to_string(), json!(quick_tools));
+                    if let Some(slice) = &universal {
+                        map.insert("universal".to_string(), json!(slice));
+                    }
                     if !matches!(self.mode, ServerMode::Worker) {
                         map.insert("session_id".to_string(), json!(self.session_id));
                         self.apply_close_metadata(map, close_token);
@@ -2776,7 +3194,7 @@ impl IdaMcpServer {
             return None;
         }
         let size = meta.len();
-        (size > OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES).then_some(size)
+        exceeds_background_threshold(size).then_some(size)
     }
 
     fn is_database_path(path: &str) -> bool {
@@ -2807,6 +3225,100 @@ impl IdaMcpServer {
         )
     }
 
+    /// Offer background analysis only where tasks are routed; a pooled worker
+    /// leaves that decision to its parent.
+    fn background_prompt_applies(&self, auto_analyse: bool) -> bool {
+        auto_analyse && !matches!(self.mode, ServerMode::Worker)
+    }
+
+    /// Whether this call answers prompts through MCP 2026 round trips. Older
+    /// clients answer inline, where MRTR fields are meaningless.
+    fn uses_mrtr(
+        ctx: &RequestContext<RoleServer>,
+        prompts: &OpenPrompts,
+    ) -> Result<bool, McpError> {
+        if speaks_mcp_2026(ctx) {
+            return Ok(true);
+        }
+        if prompts.request_state.is_some() || prompts.input_responses.is_some() {
+            return Err(McpError::invalid_params(
+                "requestState and inputResponses require MCP 2026-07-28",
+                None,
+            ));
+        }
+        Ok(false)
+    }
+
+    /// Run one MCP 2026 form stage: ask `form` on the first call, or read the
+    /// answer from the sealed retry. `associated_data` binds the sealed state
+    /// to the inputs the question depends on.
+    fn mrtr_form_stage(
+        &self,
+        prompts: &mut OpenPrompts,
+        stage: &MrtrStage,
+        associated_data: &str,
+        form: ElicitRequestParams,
+    ) -> Result<MrtrStep, McpError> {
+        let supports_form = prompts.form_elicitation;
+        let Some(sealed) = prompts.request_state.take() else {
+            if prompts.input_responses.is_some() {
+                return Err(McpError::invalid_params(
+                    "inputResponses require a matching requestState",
+                    None,
+                ));
+            }
+            if !supports_form {
+                return Ok(MrtrStep::NoFormSupport);
+            }
+            let sealed = self.request_state_codec.seal_with(
+                stage.seal,
+                &SealOptions::new()
+                    .associated_data(associated_data.as_bytes())
+                    .ttl(Duration::from_secs(OPEN_IDB_REQUEST_STATE_TTL_SECS)),
+            );
+            let mut input_requests = InputRequests::new();
+            input_requests.insert(
+                stage.key.to_string(),
+                InputRequest::Elicitation(ElicitRequest::new(form)),
+            );
+            return Ok(MrtrStep::InputRequired(InputRequiredResult::new(
+                Some(input_requests),
+                Some(sealed),
+            )));
+        };
+        let responses = prompts.input_responses.take();
+        if !supports_form {
+            return Err(McpError::invalid_params(
+                "MRTR retry omitted the form elicitation capability",
+                None,
+            ));
+        }
+        let opened = self
+            .request_state_codec
+            .open_with(&sealed, associated_data.as_bytes())
+            .map_err(|_| {
+                McpError::invalid_params("expired, tampered, or unknown requestState", None)
+            })?;
+        if opened != stage.seal {
+            return Err(McpError::invalid_params(
+                "requestState belongs to a different MRTR stage",
+                None,
+            ));
+        }
+        let key = stage.key;
+        let response = responses
+            .as_ref()
+            .and_then(|responses| responses.get(key))
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("missing {key} elicitation response"), None)
+            })?;
+        serde_json::from_value(response.clone())
+            .map(MrtrStep::Answered)
+            .map_err(|_| {
+                McpError::invalid_params(format!("invalid {key} elicitation response action"), None)
+            })
+    }
+
     /// Decide whether `open_idb` should route auto-analysis to a background
     /// task. Asks the user via MCP elicitation when the client advertises the
     /// capability; falls back to "background" silently otherwise so large
@@ -2818,31 +3330,13 @@ impl IdaMcpServer {
         ctx: &RequestContext<RoleServer>,
         path: &str,
         size_bytes: u64,
-        request_timeout_secs: Option<u64>,
-        request_state: Option<String>,
-        input_responses: Option<InputResponses>,
+        prompts: &mut OpenPrompts,
     ) -> Result<OpenIdbBackgroundDecision, McpError> {
         use rmcp::service::{ElicitationError, ServiceError};
 
         let size_mib = size_bytes / (1024 * 1024);
-        let modern_protocol = ctx
-            .protocol_version()
-            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
-        if modern_protocol {
-            return self.modern_choose_open_idb_background(
-                ctx,
-                path,
-                size_bytes,
-                request_state,
-                input_responses,
-            );
-        }
-
-        if request_state.is_some() || input_responses.is_some() {
-            return Err(McpError::invalid_params(
-                "requestState and inputResponses require MCP 2026-07-28",
-                None,
-            ));
+        if Self::uses_mrtr(ctx, prompts)? {
+            return self.modern_open_idb_background_decision(path, size_bytes, prompts);
         }
 
         if ctx.peer.supported_elicitation_modes().is_empty() {
@@ -2856,8 +3350,13 @@ impl IdaMcpServer {
         let prompt = Self::open_idb_background_prompt(path, size_bytes);
 
         let elicitation_timeout_secs =
-            Self::open_idb_elicitation_timeout_secs(request_timeout_secs);
+            Self::open_idb_elicitation_timeout_secs(prompts.timeout_secs);
         let client_cancel = ctx.ct.clone();
+        let shutdown = ctx
+            .extensions
+            .get::<crate::transport::PendingStdioRequest>()
+            .map(crate::transport::PendingStdioRequest::shutdown_token)
+            .unwrap_or_default();
         let elicitation = ctx.peer.elicit_with_timeout::<OpenIdbBackgroundChoice>(
             prompt,
             Some(Duration::from_secs(elicitation_timeout_secs)),
@@ -2865,6 +3364,9 @@ impl IdaMcpServer {
 
         let result = tokio::select! {
             biased;
+            _ = shutdown.cancelled() => {
+                return Err(McpError::internal_error("server is shutting down", None));
+            }
             _ = client_cancel.cancelled() => {
                 info!(
                     path,
@@ -2906,126 +3408,177 @@ impl IdaMcpServer {
         Ok(OpenIdbBackgroundDecision::Ready(background))
     }
 
-    /// MCP 2026 (MRTR) preamble for the background decision: validates the
-    /// requestState/capability pairing before the sealed-state round-trip.
-    fn modern_choose_open_idb_background(
-        &self,
-        ctx: &RequestContext<RoleServer>,
-        path: &str,
-        size_bytes: u64,
-        request_state: Option<String>,
-        input_responses: Option<InputResponses>,
-    ) -> Result<OpenIdbBackgroundDecision, McpError> {
-        if request_state.is_none() && input_responses.is_some() {
-            return Err(McpError::invalid_params(
-                "inputResponses require a matching requestState",
-                None,
-            ));
-        }
-        let supports_form_elicitation = ctx
-            .client_capabilities()
-            .and_then(|capabilities| capabilities.elicitation)
-            .and_then(|elicitation| elicitation.form)
-            .is_some();
-        if request_state.is_none() && !supports_form_elicitation {
-            info!(
-                path,
-                size_mib = size_bytes / (1024 * 1024),
-                "client lacks form elicitation; routing open_idb auto-analysis to background"
-            );
-            return Ok(OpenIdbBackgroundDecision::Ready(true));
-        }
-        if !supports_form_elicitation {
-            return Err(McpError::invalid_params(
-                "MRTR retry omitted the form elicitation capability",
-                None,
-            ));
-        }
-        self.modern_open_idb_background_decision(path, size_bytes, request_state, input_responses)
-    }
-
+    /// MCP 2026 (MRTR) form of the background question.
     fn modern_open_idb_background_decision(
         &self,
         path: &str,
         size_bytes: u64,
-        request_state: Option<String>,
-        input_responses: Option<InputResponses>,
+        prompts: &mut OpenPrompts,
     ) -> Result<OpenIdbBackgroundDecision, McpError> {
-        const STAGE: &[u8] = b"open_idb/background-confirmation/v1";
-        const INPUT_KEY: &str = "background";
-
+        let form = ElicitRequestParams::FormElicitationParams {
+            meta: None,
+            message: Self::open_idb_background_prompt(path, size_bytes),
+            requested_schema: background_choice_schema()?,
+        };
         let associated_data = format!("tools/call:open_idb\0{path}\0{size_bytes}");
-        let Some(sealed) = request_state else {
-            if input_responses.is_some() {
-                return Err(McpError::invalid_params(
-                    "inputResponses require a matching requestState",
-                    None,
-                ));
+        let step = self.mrtr_form_stage(prompts, &BACKGROUND_STAGE, &associated_data, form)?;
+        Ok(match step {
+            MrtrStep::InputRequired(result) => OpenIdbBackgroundDecision::InputRequired(result),
+            MrtrStep::NoFormSupport => {
+                info!(
+                    path,
+                    size_mib = size_bytes / (1024 * 1024),
+                    "client lacks form elicitation; routing open_idb auto-analysis to background"
+                );
+                OpenIdbBackgroundDecision::Ready(true)
             }
-            let sealed = self.request_state_codec.seal_with(
-                STAGE,
-                &SealOptions::new()
-                    .associated_data(associated_data.as_bytes())
-                    .ttl(Duration::from_secs(OPEN_IDB_REQUEST_STATE_TTL_SECS)),
-            );
-            // Reuse the same schema the legacy elicitation path derives from
-            // `OpenIdbBackgroundChoice`, so the two protocols cannot drift.
-            let requested_schema = ElicitationSchema::from_type::<OpenIdbBackgroundChoice>()
-                .map_err(|error| {
-                    McpError::internal_error(
-                        format!("failed to build open_idb elicitation schema: {error}"),
-                        None,
-                    )
-                })?;
-            let mut input_requests = InputRequests::new();
-            input_requests.insert(
-                INPUT_KEY.to_string(),
-                InputRequest::Elicitation(ElicitRequest::new(
-                    ElicitRequestParams::FormElicitationParams {
-                        meta: None,
-                        message: Self::open_idb_background_prompt(path, size_bytes),
-                        requested_schema,
-                    },
-                )),
-            );
-            return Ok(OpenIdbBackgroundDecision::InputRequired(
-                InputRequiredResult::new(Some(input_requests), Some(sealed)),
-            ));
-        };
+            MrtrStep::Answered(response) => {
+                OpenIdbBackgroundDecision::Ready(match response.action {
+                    ElicitationAction::Accept => accepted_background(response.content),
+                    ElicitationAction::Decline | ElicitationAction::Cancel => false,
+                    // `ElicitationAction` is #[non_exhaustive]; treat unknown
+                    // future actions as a decline so we never background
+                    // without consent.
+                    _ => false,
+                })
+            }
+        })
+    }
 
-        let opened = self
-            .request_state_codec
-            .open_with(&sealed, associated_data.as_bytes())
-            .map_err(|_| {
-                McpError::invalid_params("expired, tampered, or unknown requestState", None)
-            })?;
-        if opened != STAGE {
-            return Err(McpError::invalid_params(
-                "requestState belongs to a different MRTR stage",
-                None,
-            ));
-        }
-        let response = input_responses
-            .as_ref()
-            .and_then(|responses| responses.get(INPUT_KEY))
-            .ok_or_else(|| {
-                McpError::invalid_params("missing background elicitation response", None)
-            })?;
-        let response: ElicitResult = serde_json::from_value(response.clone()).map_err(|_| {
-            McpError::invalid_params("invalid background elicitation response action", None)
-        })?;
-        let background = match response.action {
-            ElicitationAction::Accept => response
-                .content
-                .and_then(|content| serde_json::from_value::<OpenIdbBackgroundChoice>(content).ok())
-                .and_then(|choice| choice.background)
-                .unwrap_or(true),
-            ElicitationAction::Decline | ElicitationAction::Cancel => false,
-            // `ElicitationAction` is #[non_exhaustive]; treat unknown future
-            // actions as a decline so we never background without consent.
-            _ => false,
+    /// Resolve a universal Mach-O input to one slice file before opening it.
+    ///
+    /// The slice comes from `arch`, from a single-slice file, or from the user
+    /// through an input request. Without an answer (no form support, declined,
+    /// timed out) the call fails with the slice list so the caller can retry
+    /// with `arch`; it never guesses.
+    async fn resolve_universal_input(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        path: &str,
+        arch: Option<String>,
+        idb_out: Option<&str>,
+        prompts: &mut OpenPrompts,
+    ) -> Result<UniversalInput, McpError> {
+        let input = crate::expand_path(path);
+        let slices = match universal_slices(&input, path, arch.as_deref()) {
+            Ok(Some(slices)) => slices,
+            Ok(None) => return Ok(UniversalInput::NotUniversal),
+            Err(error) => return Ok(UniversalInput::Rejected(error)),
         };
-        Ok(OpenIdbBackgroundDecision::Ready(background))
+        let (slice, background) = match (arch, slices.as_slice()) {
+            (Some(arch), _) => match crate::macho_fat::select_slice(&slices, &arch) {
+                Some(slice) => (slice.clone(), None),
+                None => {
+                    let reason = format!("no {arch} slice");
+                    return Ok(UniversalInput::Rejected(slice_required_error(
+                        path, &slices, &reason,
+                    )));
+                }
+            },
+            (None, [only]) => (only.clone(), None),
+            (None, _) => match self.ask_for_slice(ctx, path, &slices, prompts).await? {
+                SliceAnswer::Chosen(slice, background) => (slice, background),
+                SliceAnswer::InputRequired(result) => {
+                    return Ok(UniversalInput::InputRequired(result));
+                }
+                SliceAnswer::Unanswered(reason) => {
+                    return Ok(UniversalInput::Rejected(slice_required_error(
+                        path, &slices, &reason,
+                    )));
+                }
+            },
+        };
+        let slice_path = match extract_universal_slice(&input, idb_out, &slice).await {
+            Ok(slice_path) => slice_path,
+            Err(error) => return Ok(UniversalInput::Rejected(error)),
+        };
+        Ok(UniversalInput::Resolved(UniversalSlice {
+            arch: slice.arch,
+            slices: slices.into_iter().map(|slice| slice.arch).collect(),
+            slice_path: slice_path.display().to_string(),
+            background,
+        }))
+    }
+
+    /// Ask the user which slice of a universal Mach-O to analyze.
+    async fn ask_for_slice(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        path: &str,
+        slices: &[crate::macho_fat::FatSlice],
+        prompts: &mut OpenPrompts,
+    ) -> Result<SliceAnswer, McpError> {
+        let ask_background = prompts.background_prompt
+            && slices
+                .iter()
+                .any(|slice| exceeds_background_threshold(slice.size));
+        let form = universal_slice_form(path, slices, ask_background)?;
+        let response = if Self::uses_mrtr(ctx, prompts)? {
+            let layout = slices
+                .iter()
+                .map(|slice| format!("{}@{:#x}+{:#x}", slice.arch, slice.offset, slice.size))
+                .collect::<Vec<_>>()
+                .join(",");
+            let associated_data =
+                format!("tools/call:open_idb\0{path}\0{layout}\0{ask_background}");
+            match self.mrtr_form_stage(prompts, &SLICE_STAGE, &associated_data, form)? {
+                MrtrStep::InputRequired(result) => return Ok(SliceAnswer::InputRequired(result)),
+                MrtrStep::NoFormSupport => {
+                    return Ok(SliceAnswer::Unanswered(NO_FORM_SUPPORT.to_string()));
+                }
+                MrtrStep::Answered(response) => response,
+            }
+        } else {
+            match Self::elicit_slice_inline(ctx, path, form, prompts.timeout_secs).await {
+                Ok(response) => response,
+                Err(reason) => return Ok(SliceAnswer::Unanswered(reason)),
+            }
+        };
+        Ok(match slice_answer_from(response, slices, ask_background) {
+            Ok((slice, background)) => SliceAnswer::Chosen(slice, background),
+            Err(reason) => SliceAnswer::Unanswered(reason),
+        })
+    }
+
+    /// Ask a pre-2026 client inline, bounded by the prompt timeout. `Err`
+    /// says why no answer arrived.
+    async fn elicit_slice_inline(
+        ctx: &RequestContext<RoleServer>,
+        path: &str,
+        form: ElicitRequestParams,
+        request_timeout_secs: Option<u64>,
+    ) -> Result<ElicitResult, String> {
+        use rmcp::service::{ElicitationMode, ServiceError};
+
+        if !ctx
+            .peer
+            .supported_elicitation_modes()
+            .contains(&ElicitationMode::Form)
+        {
+            return Err(NO_FORM_SUPPORT.to_string());
+        }
+        let timeout_secs = Self::open_idb_elicitation_timeout_secs(request_timeout_secs);
+        let shutdown = ctx
+            .extensions
+            .get::<crate::transport::PendingStdioRequest>()
+            .map(crate::transport::PendingStdioRequest::shutdown_token)
+            .unwrap_or_default();
+        let elicitation = ctx
+            .peer
+            .create_elicitation_with_timeout(form, Some(Duration::from_secs(timeout_secs)));
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err("the server is shutting down".to_string()),
+            _ = ctx.ct.cancelled() => return Err("the request was cancelled".to_string()),
+            result = elicitation => result,
+        };
+        result.map_err(|error| match error {
+            ServiceError::Timeout { .. } => {
+                info!(path, timeout_secs, "open_idb slice prompt timed out");
+                format!("no slice was chosen within {timeout_secs}s")
+            }
+            error => format!("the slice prompt failed: {error}"),
+        })
     }
 
     #[tool(
@@ -3274,7 +3827,6 @@ impl IdaMcpServer {
                 false,
                 false,
                 req.rebuild.unwrap_or(false),
-                None,
                 false,
                 RawBinaryTarget::default(),
                 Vec::new(),
@@ -3356,17 +3908,25 @@ impl IdaMcpServer {
         debug!("Tool call: analysis_status");
         match self.worker.analysis_status().await {
             Ok(status) => {
-                let mut value =
-                    serde_json::to_value(&status).unwrap_or_else(|_| json!(format!("{status:?}")));
-                if !matches!(self.mode, ServerMode::Worker)
-                    && let Value::Object(map) = &mut value
-                {
-                    map.insert("session_id".to_string(), json!(self.session_id));
-                }
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{status:?}")),
-                )]))
+                let session_id = match self.mode {
+                    ServerMode::Worker => None,
+                    ServerMode::Stdio | ServerMode::Http => Some(self.session_id.clone()),
+                };
+                Ok(typed_result(&AnalysisStatusOutput { status, session_id }))
             }
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Save the open database to disk without closing it. \
+        Use this to checkpoint renames, comments, types, and patches.")]
+    #[instrument(skip_all)]
+    async fn save_idb(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: save_idb");
+        match self.worker.save_database().await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &result,
+            ))])),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -3383,25 +3943,30 @@ impl IdaMcpServer {
         Parameters(req): Parameters<CloseIdbRequest>,
     ) -> Result<CallToolResult, McpError> {
         info!("Tool call: close_idb received");
-        if !self.workspace_enabled()
+        let result = if !self.workspace_enabled()
             && matches!(self.mode, ServerMode::Http)
             && self.worker.uses_close_tokens()
         {
-            match self.worker.authorize_close(
-                &self.session_id,
-                req.token.as_deref(),
-                req.force.unwrap_or(false),
-            ) {
-                CloseAuthorization::Granted => {}
-                CloseAuthorization::GrantedByOverride {
+            match self
+                .worker
+                .close_authorized(
+                    &self.session_id,
+                    req.token.as_deref(),
+                    req.force.unwrap_or(false),
+                )
+                .await
+            {
+                Ok(CloseAuthorization::Granted) => Ok(()),
+                Ok(CloseAuthorization::GrantedByOverride {
                     previous_owner_session_id,
-                } => {
+                }) => {
                     info!(
                         previous_owner_session_id = ?previous_owner_session_id,
                         "close_idb overriding previous HTTP owner session"
                     );
+                    Ok(())
                 }
-                CloseAuthorization::Denied { owner_session_id } => {
+                Ok(CloseAuthorization::Denied { owner_session_id }) => {
                     info!(owner_session_id = ?owner_session_id, "close_idb ignored: owner token required");
                     return Ok(CallToolResult::success(vec![Content::text(
                         serde_json::to_string_pretty(&json!({
@@ -3413,9 +3978,11 @@ impl IdaMcpServer {
                         .unwrap_or_else(|_| "close_idb ignored: owner token required".to_string()),
                     )]));
                 }
+                Err(error) => Err(error),
             }
-        }
-        let result = self.worker.close().await;
+        } else {
+            self.worker.close().await
+        };
         if workspace_close_should_remove_entry(
             &result,
             &self.task_registry,
@@ -3428,7 +3995,6 @@ impl IdaMcpServer {
         }
         match result {
             Ok(()) => {
-                self.worker.clear_close_token();
                 info!("Tool call: close_idb completed successfully");
                 Ok(CallToolResult::success(vec![Content::text(
                     "Database closed",
@@ -3642,39 +4208,7 @@ impl IdaMcpServer {
             .list_functions(offset, limit, filter, timeout_secs)
             .await
         {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
-    }
-
-    #[tool(description = "List functions (ida-pro-mcp compatible alias).")]
-    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
-    async fn list_funcs(
-        &self,
-        Parameters(req): Parameters<ListFunctionsRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        debug!("Tool call: list_funcs");
-        let limit = try_param!(parse_optional_unsigned::<usize>(req.limit, "limit"))
-            .unwrap_or(100)
-            .min(10000);
-        let offset =
-            try_param!(parse_optional_unsigned::<usize>(req.offset, "offset")).unwrap_or(0);
-        let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
-            req.timeout_secs,
-            "timeout_secs"
-        ));
-        let filter = req.filter.clone();
-
-        match self
-            .worker
-            .list_functions(offset, limit, filter, timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
+            Ok(result) => Ok(typed_result(&result)),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -3687,20 +4221,18 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: resolve_function");
         match self.worker.resolve_function(&req.name).await {
-            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{:?}", info)),
-            )])),
+            Ok(info) => Ok(typed_result(&info)),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
 
-    #[tool(description = "Get address context (segment, function, nearest symbol)")]
+    #[tool(description = "Get address context (segment, function, nearest symbol) for one address")]
     async fn addr_info(
         &self,
         Parameters(req): Parameters<AddrInfoRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -3719,13 +4251,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get the function that contains an address")]
+    #[tool(description = "Get the function that contains one address (one address per call)")]
     async fn function_at(
         &self,
         Parameters(req): Parameters<FunctionAtRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -3737,14 +4269,14 @@ impl IdaMcpServer {
             .function_at(addr, req.target_name.clone(), offset)
             .await
         {
-            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{:?}", info)),
-            )])),
+            Ok(info) => Ok(typed_result(&info)),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
 
-    #[tool(description = "Get disassembly at an address")]
+    #[tool(
+        description = "Get disassembly at one or more addresses (address accepts an array; one result per address)"
+    )]
     #[instrument(skip_all, fields(address = %req.address, count = req.count))]
     async fn disasm(
         &self,
@@ -3773,6 +4305,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "disasm": text
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -3793,11 +4326,11 @@ impl IdaMcpServer {
         Parameters(req): Parameters<RenderRangeRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: render_range");
-        let start = match Self::value_to_single_address(&req.start) {
+        let start = match Self::value_to_exactly_one_address(&req.start, "start") {
             Ok(address) => address,
             Err(error) => return Ok(error.to_tool_result()),
         };
-        let end = match Self::value_to_single_address(&req.end) {
+        let end = match Self::value_to_exactly_one_address(&req.end, "end") {
             Ok(address) => address,
             Err(error) => return Ok(error.to_tool_result()),
         };
@@ -3830,13 +4363,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Disassemble the function containing an address")]
+    #[tool(description = "Disassemble the function containing one address (one address per call)")]
     async fn disasm_function_at(
         &self,
         Parameters(req): Parameters<DisasmFunctionAtRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -3856,7 +4389,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Decompile a function using Hex-Rays (if available)")]
+    #[tool(
+        description = "Decompile one or more functions with Hex-Rays (address accepts an array; one result per function)"
+    )]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn decompile(
         &self,
@@ -3881,6 +4416,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "decompile": code
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -3895,7 +4431,158 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Get decompiled pseudocode at a specific address or address range. \
+        description = "List Hex-Rays locals and arguments in one function. Select one address or exact target_name; returns names, types, locations, opaque edit locators when available, and pagination."
+    )]
+    async fn list_lvars(
+        &self,
+        Parameters(req): Parameters<ListLvarsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name"
+        ));
+        let offset =
+            try_param!(parse_optional_unsigned::<usize>(req.offset, "offset")).unwrap_or(0);
+        let limit = try_param!(parse_optional_unsigned::<usize>(req.limit, "limit")).unwrap_or(100);
+        if !(1..=1000).contains(&limit) {
+            return Ok(
+                ToolError::InvalidParams("limit must be between 1 and 1000".into())
+                    .to_tool_result(),
+            );
+        }
+        let timeout = try_param!(decompiler_timeout(req.timeout_secs));
+        match self
+            .worker
+            .list_lvars(addr, req.target_name, offset, limit, Some(timeout))
+            .await
+        {
+            Ok(result) => Ok(typed_result(&result)),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Persistently rename one Hex-Rays local variable. Select an exact function and one local: lvar_locator from list_lvars (preferred) or an exact lvar_name. Returns the old variable and resolved target; save_idb writes the database to disk."
+    )]
+    async fn rename_lvar(
+        &self,
+        Parameters(req): Parameters<RenameLvarRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name"
+        ));
+        let timeout = try_param!(decompiler_timeout(req.timeout_secs));
+        let selector = try_param!(crate::ida::handlers::lvars::local_selector(
+            req.lvar_name,
+            req.lvar_locator
+        ));
+        match self
+            .worker
+            .rename_lvar(addr, req.target_name, selector, req.new_name, Some(timeout))
+            .await
+        {
+            Ok(result) => Ok(typed_result(&result)),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Persistently set one Hex-Rays local variable's C type. Select an exact function and one local: lvar_locator from list_lvars (preferred) or an exact lvar_name. Rejects invalid or incompatible types; save_idb writes the database to disk."
+    )]
+    async fn set_lvar_type(
+        &self,
+        Parameters(req): Parameters<SetLvarTypeRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name"
+        ));
+        let timeout = try_param!(decompiler_timeout(req.timeout_secs));
+        let selector = try_param!(crate::ida::handlers::lvars::local_selector(
+            req.lvar_name,
+            req.lvar_locator
+        ));
+        match self
+            .worker
+            .set_lvar_type(addr, req.target_name, selector, req.decl, Some(timeout))
+            .await
+        {
+            Ok(result) => Ok(typed_result(&result)),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "List end-of-line comment locations in one function's Hex-Rays pseudocode. Select one address or exact target_name; returns each line's locator, address, text, existing comment, and pagination."
+    )]
+    async fn list_pseudocode_comments(
+        &self,
+        Parameters(req): Parameters<ListPseudocodeCommentsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name"
+        ));
+        let offset =
+            try_param!(parse_optional_unsigned::<usize>(req.offset, "offset")).unwrap_or(0);
+        let limit = try_param!(parse_optional_unsigned::<usize>(req.limit, "limit")).unwrap_or(100);
+        if !(1..=1000).contains(&limit) {
+            return Ok(
+                ToolError::InvalidParams("limit must be between 1 and 1000".into())
+                    .to_tool_result(),
+            );
+        }
+        let timeout = try_param!(decompiler_timeout(req.timeout_secs));
+        match self
+            .worker
+            .list_pseudocode_comments(addr, req.target_name, offset, limit, Some(timeout))
+            .await
+        {
+            Ok(result) => Ok(typed_result(&result)),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Set, replace, or remove a persistent Hex-Rays pseudocode comment. Select an exact function and a comment_locator from list_pseudocode_comments. Empty comment removes it; save_idb writes the database to disk."
+    )]
+    async fn set_pseudocode_comment(
+        &self,
+        Parameters(req): Parameters<SetPseudocodeCommentRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name"
+        ));
+        try_param!(crate::ida::handlers::annotations::check_pseudocode_comment(
+            &req.comment_locator,
+            &req.comment
+        ));
+        let timeout = try_param!(decompiler_timeout(req.timeout_secs));
+        match self
+            .worker
+            .set_pseudocode_comment(
+                addr,
+                req.target_name,
+                req.comment_locator,
+                req.comment,
+                Some(timeout),
+            )
+            .await
+        {
+            Ok(result) => Ok(typed_result(&result)),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Get decompiled pseudocode at one or more addresses or address ranges. \
         Unlike 'decompile' which returns the full function, this returns only the statements \
         that correspond to the given address(es). Useful for getting pseudocode for a basic block \
         or specific instruction. If end_address is provided, returns statements covering the range."
@@ -3936,6 +4623,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "pseudocode": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -3983,9 +4671,7 @@ impl IdaMcpServer {
             .strings(offset, limit, req.filter, timeout_secs)
             .await
         {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
+            Ok(result) => Ok(typed_result(&result)),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -4066,7 +4752,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Get cross-references TO an address (who references this address). \
+        description = "Get cross-references TO one or more addresses (address accepts an array). \
         Paginated (default limit 1000, max 10000); when truncated=true, pass next_offset back \
         as offset to page through high-frequency targets."
     )]
@@ -4080,7 +4766,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Get cross-references FROM an address (what this address references). \
+        description = "Get cross-references FROM one or more addresses (address accepts an array). \
         Paginated (default limit 1000, max 10000); when truncated=true, pass next_offset back \
         as offset to page through the remaining references."
     )]
@@ -4147,7 +4833,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Read raw bytes from an address as hex string")]
+    #[tool(
+        description = "Read raw bytes at one or more addresses as hex strings (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(size = req.size))]
     async fn get_bytes(
         &self,
@@ -4179,6 +4867,7 @@ impl IdaMcpServer {
                             "address": format!("{:#x}", addr),
                             "bytes": result
                         })),
+                        Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                         Err(e) => results.push(json!({
                             "address": format!("{:#x}", addr),
                             "error": e.to_string()
@@ -4216,14 +4905,14 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_patches");
         let start = match req.start.as_ref() {
-            Some(value) => match Self::value_to_single_address(value) {
+            Some(value) => match Self::value_to_exactly_one_address(value, "address") {
                 Ok(address) => Some(address),
                 Err(error) => return Ok(error.to_tool_result()),
             },
             None => None,
         };
         let end = match req.end.as_ref() {
-            Some(value) => match Self::value_to_single_address(value) {
+            Some(value) => match Self::value_to_exactly_one_address(value, "address") {
                 Ok(address) => Some(address),
                 Err(error) => return Ok(error.to_tool_result()),
             },
@@ -4243,7 +4932,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get basic blocks of a function (control flow graph nodes)")]
+    #[tool(description = "Get basic blocks of one or more functions (address accepts an array)")]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn basic_blocks(
         &self,
@@ -4271,6 +4960,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "basic_blocks": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4284,7 +4974,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get functions called BY a function (callees/children in call graph)")]
+    #[tool(
+        description = "Get functions called BY one or more functions (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn callees(
         &self,
@@ -4312,6 +5004,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "callees": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4325,7 +5018,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get functions that CALL a function (callers/parents in call graph)")]
+    #[tool(
+        description = "Get functions that CALL one or more functions (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn callers(
         &self,
@@ -4353,6 +5048,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "callers": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4525,6 +5221,7 @@ impl IdaMcpServer {
                         "next_offset": next_offset
                     }));
                 }
+                Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                 Err(e) => results.push(json!({
                     "pattern": pattern,
                     "error": e.to_string()
@@ -4621,6 +5318,7 @@ impl IdaMcpServer {
                         "next_offset": next_offset
                     }));
                 }
+                Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                 Err(e) => results.push(json!({
                     "target": target,
                     "error": e.to_string()
@@ -4634,40 +5332,25 @@ impl IdaMcpServer {
         )]))
     }
 
-    #[tool(description = "Read u8 values at address(es)")]
-    #[instrument(skip_all)]
-    async fn get_u8(
+    #[tool(description = "Read unsigned integer(s) of a given byte width at address(es)")]
+    #[instrument(skip_all, fields(size = req.size))]
+    async fn read_int(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<ReadIntRequest>,
     ) -> Result<CallToolResult, McpError> {
-        get_int_values(&self.worker, req.address, 1).await
-    }
-
-    #[tool(description = "Read u16 values at address(es)")]
-    #[instrument(skip_all)]
-    async fn get_u16(
-        &self,
-        Parameters(req): Parameters<AddressRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        get_int_values(&self.worker, req.address, 2).await
-    }
-
-    #[tool(description = "Read u32 values at address(es)")]
-    #[instrument(skip_all)]
-    async fn get_u32(
-        &self,
-        Parameters(req): Parameters<AddressRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        get_int_values(&self.worker, req.address, 4).await
-    }
-
-    #[tool(description = "Read u64 values at address(es)")]
-    #[instrument(skip_all)]
-    async fn get_u64(
-        &self,
-        Parameters(req): Parameters<AddressRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        get_int_values(&self.worker, req.address, 8).await
+        let size = match req.size {
+            1 => 1,
+            2 => 2,
+            4 => 4,
+            8 => 8,
+            other => {
+                return Ok(ToolError::InvalidParams(format!(
+                    "unsupported integer size {other}; use 1, 2, 4, or 8 bytes"
+                ))
+                .to_tool_result());
+            }
+        };
+        get_int_values(&self.worker, req.address, size).await
     }
 
     #[tool(description = "Read string(s) at address(es)")]
@@ -4701,6 +5384,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "string": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4742,6 +5426,7 @@ impl IdaMcpServer {
                         "query": query,
                         "value": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "query": query,
                         "error": e.to_string()
@@ -4762,11 +5447,11 @@ impl IdaMcpServer {
         Parameters(req): Parameters<FindPathsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: find_paths");
-        let start = match Self::value_to_single_address(&req.start) {
+        let start = match Self::value_to_exactly_one_address(&req.start, "start") {
             Ok(v) => v,
             Err(e) => return Ok(e.to_tool_result()),
         };
-        let end = match Self::value_to_single_address(&req.end) {
+        let end = match Self::value_to_exactly_one_address(&req.end, "end") {
             Ok(v) => v,
             Err(e) => return Ok(e.to_tool_result()),
         };
@@ -4789,7 +5474,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Build a callgraph rooted at an address")]
+    #[tool(
+        description = "Build a callgraph rooted at one or more addresses (roots accepts an array)"
+    )]
     #[instrument(skip_all)]
     async fn callgraph(
         &self,
@@ -4835,6 +5522,7 @@ impl IdaMcpServer {
                         "root": format!("{:#x}", root),
                         "callgraph": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "root": format!("{:#x}", root),
                         "error": e.to_string()
@@ -4914,50 +5602,6 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Convert integers between bases")]
-    #[instrument(skip_all)]
-    async fn int_convert(
-        &self,
-        Parameters(req): Parameters<IntConvertRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        debug!("Tool call: int_convert");
-        let inputs = match Self::value_to_strings(&req.inputs) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-
-        let mut results = Vec::new();
-        for input in inputs {
-            match Self::parse_address(&input) {
-                Ok(value) => {
-                    let le = value.to_le_bytes();
-                    let be = value.to_be_bytes();
-                    let le_trim = trim_bytes_le(&le);
-                    let be_trim = trim_bytes_be(&be);
-                    results.push(json!({
-                        "input": input,
-                        "value": value,
-                        "dec": value.to_string(),
-                        "hex": format!("0x{:x}", value),
-                        "bin": format!("0b{:b}", value),
-                        "bytes_le": hex_encode(&le_trim),
-                        "bytes_be": hex_encode(&be_trim),
-                        "ascii": bytes_to_ascii(&le_trim),
-                    }));
-                }
-                Err(e) => results.push(json!({
-                    "input": input,
-                    "error": e.to_string()
-                })),
-            }
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({ "results": results }))
-                .unwrap_or_else(|_| format!("{:?}", results)),
-        )]))
-    }
-
     #[tool(description = "List local types")]
     async fn local_types(
         &self,
@@ -5027,7 +5671,7 @@ impl IdaMcpServer {
         let addr = try_param!(req
             .address
             .as_ref()
-            .map(Self::value_to_single_address)
+            .map(|value| Self::value_to_exactly_one_address(value, "address"))
             .transpose());
         match self
             .worker
@@ -5053,11 +5697,11 @@ impl IdaMcpServer {
             req.timeout_secs,
             "timeout_secs"
         ));
-        let addr = try_param!(req
-            .address
-            .as_ref()
-            .map(Self::value_to_single_address)
-            .transpose());
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ));
         match self
             .worker
             .lumina_apply(addr, req.target_name.clone(), offset, force, timeout_secs)
@@ -5070,19 +5714,22 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Set comments at an address")]
+    #[tool(
+        description = "Set a disassembly comment at an address. Disassembly comments do not appear in Hex-Rays pseudocode; use set_pseudocode_comment for those."
+    )]
     async fn set_comments(
         &self,
         Parameters(req): Parameters<SetCommentsRequest>,
     ) -> Result<CallToolResult, McpError> {
         let repeatable = req.repeatable.unwrap_or(false);
         let offset = req.offset.unwrap_or(0);
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         match self
             .worker
@@ -5108,12 +5755,13 @@ impl IdaMcpServer {
         Parameters(req): Parameters<PatchAsmRequest>,
     ) -> Result<CallToolResult, McpError> {
         let offset = req.offset.unwrap_or(0);
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         match self
             .worker
@@ -5147,12 +5795,14 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get stack frame info")]
+    #[tool(
+        description = "Get stack frame info for the function at one address (one address per call)"
+    )]
     async fn stack_frame(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<SingleAddressRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match Self::value_to_single_address(&req.address) {
+        let addr = match Self::value_to_exactly_one_address(&req.address, "address") {
             Ok(addr) => addr,
             Err(e) => return Ok(e.to_tool_result()),
         };
@@ -5169,12 +5819,13 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<DeclareStackRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         let relaxed = req.relaxed.unwrap_or(false);
         match self
@@ -5201,12 +5852,13 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<DeleteStackRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         match self
             .worker
@@ -5270,7 +5922,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Read values of a struct instance at an address")]
+    #[tool(
+        description = "Read values of a struct instance at one or more addresses (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(address = %req.address, ordinal = req.ordinal, name = ?req.name))]
     async fn read_struct(
         &self,
@@ -5303,6 +5957,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "struct": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -5407,12 +6062,13 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<ApplyTypesRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         let offset = req.offset.unwrap_or(0);
         let relaxed = req.relaxed.unwrap_or(false);
@@ -5441,13 +6097,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Infer/guess type at an address")]
+    #[tool(description = "Infer/guess type at one address (one address per call)")]
     async fn infer_types(
         &self,
         Parameters(req): Parameters<InferTypesRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -5621,9 +6277,10 @@ impl IdaMcpServer {
                     }
                     task::TaskSettlement::Failed | task::TaskSettlement::Unchanged => {}
                 },
-                Err(e) => match registry.complete_with_cancel_token(
+                Err(e) => match Self::complete_background_tool_error(
                     &tid,
-                    call_tool_result_to_value(&e.to_tool_result()),
+                    &registry,
+                    &e,
                     &worker_cancel_token,
                     "Cancelled after auto-analysis settled",
                 ) {
@@ -5646,12 +6303,13 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<RenameRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.current_name.as_deref(),
+            "current_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         let flags = try_param!(parse_optional_unsigned::<i32>(req.flags, "flags")).unwrap_or(0);
         match self
@@ -5671,12 +6329,13 @@ impl IdaMcpServer {
         &self,
         Parameters(req): Parameters<PatchRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
-                Ok(v) => Some(v),
-                Err(e) => return Ok(e.to_tool_result()),
-            },
-            None => None,
+        let addr = match Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name",
+        ) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
         };
         let offset = req.offset.unwrap_or(0);
         let bytes = match Self::value_to_bytes(&req.bytes) {
@@ -5766,7 +6425,7 @@ impl IdaMcpServer {
                 // fallback only guards the type system.
                 let existing = existing_i64.unwrap_or(out_i64);
                 return self
-                    .open_dsc_direct(&existing, None, &req.module, &frameworks)
+                    .open_dsc_direct(&existing, &req.module, &frameworks)
                     .await;
             }
             // IDA 9.4 exposes ida_dscu/dscu_svc_t: the loader can open the DSC
@@ -5905,6 +6564,7 @@ impl IdaMcpServer {
             Ok(image) => {
                 let analysis_status = match self.worker.analysis_status().await {
                     Ok(status) => Some(status),
+                    Err(err) if err.is_fatal() => return Ok(err.to_tool_result()),
                     Err(err) => {
                         warn!(module = %module, error = %err, "failed to fetch analysis_status after dsc_add_dylib");
                         None
@@ -5981,6 +6641,7 @@ impl IdaMcpServer {
             Ok(region) => {
                 let analysis_status = match self.worker.analysis_status().await {
                     Ok(status) => Some(status),
+                    Err(err) if err.is_fatal() => return Ok(err.to_tool_result()),
                     Err(err) => {
                         warn!(
                             address = %ea_hex,
@@ -6142,8 +6803,11 @@ impl IdaMcpServer {
 
     #[tool(
         description = "Execute IDAPython in the open database. Provide 'code' (inline) \
-        or 'file' (path to .py), not both. Returns captured stdout/stderr. \
-        Full access to ida_*, idc, idautils."
+        or 'file' (path to .py), not both. Returns captured stdout/stderr, \
+        plus a trailing expression as `result` (JSON up to 1 MiB; \
+        result_is_repr=true when it had to fall back to repr()). Imports, \
+        variables, and functions persist between calls on the same open \
+        database. Full access to ida_*, idc, idautils."
     )]
     #[instrument(skip_all, fields(code_len = req.code.as_ref().map_or(0, String::len)))]
     async fn run_script(
@@ -6151,13 +6815,44 @@ impl IdaMcpServer {
         ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<RunScriptRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let timeout = try_param!(parse_optional_unsigned::<u64>(
+            req.timeout_secs,
+            "timeout_secs"
+        ))
+        .unwrap_or(120)
+        .min(MAX_TIMEOUT_SECS);
         let code = match (req.code, req.file) {
             (Some(code), None) => code,
             (None, Some(path)) => {
                 if !Self::validate_path(&path) {
                     return Ok(ToolError::InvalidPath(path).to_tool_result());
                 }
-                match std::fs::read_to_string(&path) {
+                let read =
+                    tokio::time::timeout(Duration::from_secs(timeout), read_script_file(&path));
+                let contents = tokio::select! {
+                    _ = ctx.ct.cancelled() => Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted, "script file read was cancelled",
+                    )),
+                    contents = read => {
+                        contents.unwrap_or_else(|_| Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut, "script file read timed out",
+                        )))
+                    }
+                };
+                let contents = match contents {
+                    Ok(contents) if contents.len() > crate::transport::MAX_MESSAGE_BYTES => {
+                        return Ok(ToolError::InvalidParams(format!(
+                            "script file exceeds the {} MCP message limit",
+                            crate::transport::message_limit_label()
+                        ))
+                        .to_tool_result());
+                    }
+                    Ok(contents) => String::from_utf8(contents).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    }),
+                    Err(error) => Err(error),
+                };
+                match contents {
                     Ok(contents) => contents,
                     Err(e) => {
                         return Ok(ToolError::InvalidPath(format!(
@@ -6181,12 +6876,6 @@ impl IdaMcpServer {
                 .to_tool_result());
             }
         };
-        let timeout = try_param!(parse_optional_unsigned::<u64>(
-            req.timeout_secs,
-            "timeout_secs"
-        ))
-        .unwrap_or(120)
-        .min(MAX_TIMEOUT_SECS);
         let foreground_timeout_secs = self.foreground_timeout_secs(Some(timeout), 120);
         match self
             .run_foreground_operation(
@@ -6243,6 +6932,30 @@ impl IdaMcpServer {
 const RUN_SCRIPT_PREVIEW_CHARS: usize = 220;
 const RUN_SCRIPT_TAIL_LINES: usize = 12;
 const RUN_SCRIPT_TAIL_CHARS: usize = 1600;
+
+async fn read_script_file(path: &str) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    // The path can be replaced after validate_path. A FIFO must not strand
+    // an unabortable blocking-pool task in open() before we can inspect it.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options.open(path).await?;
+    if !file.metadata().await?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "script path is not a regular file",
+        ));
+    }
+    let max = u64::try_from(crate::transport::MAX_MESSAGE_BYTES).map_err(std::io::Error::other)?;
+    let mut contents = Vec::new();
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut contents)
+        .await?;
+    Ok(contents)
+}
 
 fn run_script_succeeded(result: &Value) -> bool {
     result.get("success").and_then(Value::as_bool) == Some(true)
@@ -6397,6 +7110,7 @@ async fn get_int_values(
                     "address": format!("{:#x}", addr),
                     "value": result
                 })),
+                Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                 Err(e) => results.push(json!({
                     "address": format!("{:#x}", addr),
                     "error": e.to_string()
@@ -6410,38 +7124,100 @@ async fn get_int_values(
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn trim_bytes_le(bytes: &[u8]) -> Vec<u8> {
-    let mut out = bytes.to_vec();
-    while out.len() > 1 && out.last() == Some(&0) {
-        out.pop();
+/// Serialize a typed result as pretty text plus `structuredContent`, so
+/// clients that read the advertised output schema get the same value the
+/// text carries.
+fn typed_result<T: Serialize + std::fmt::Debug>(value: &T) -> CallToolResult {
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| format!("{value:?}"));
+    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    if let Ok(structured @ Value::Object(_)) = serde_json::to_value(value) {
+        result.structured_content = Some(structured);
     }
-    out
+    result
 }
 
-fn trim_bytes_be(bytes: &[u8]) -> Vec<u8> {
-    let mut start = 0usize;
-    while start + 1 < bytes.len() && bytes[start] == 0 {
-        start += 1;
+fn decompiler_timeout(value: Option<i64>) -> Result<u64, ToolError> {
+    let seconds = parse_optional_unsigned::<u64>(value, "timeout_secs")?.unwrap_or(120);
+    if !(1..=MAX_TIMEOUT_SECS).contains(&seconds) {
+        return Err(ToolError::InvalidParams(
+            "timeout_secs must be between 1 and 600".into(),
+        ));
     }
-    bytes[start..].to_vec()
+    Ok(seconds)
 }
 
-fn bytes_to_ascii(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| {
-            let c = *b as char;
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '.'
-            }
-        })
-        .collect()
+/// `analysis_status` as a client sees it: the worker's status plus the
+/// session that answered (absent inside a child worker).
+#[derive(Debug, Serialize, JsonSchema)]
+struct AnalysisStatusOutput {
+    #[serde(flatten)]
+    status: crate::ida::types::AnalysisStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+}
+
+/// One `xrefs_to`/`xrefs_from` entry when several addresses are queried at
+/// once: the address's listing, or the error that address produced.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged, deny_unknown_fields)]
+enum XrefsBatchEntry {
+    Listing {
+        address: String,
+        #[serde(flatten)]
+        listing: crate::ida::types::XRefListResult,
+    },
+    Error {
+        address: String,
+        error: String,
+    },
+}
+
+/// `xrefs_to`/`xrefs_from` return the listing itself for one address and a
+/// `results` array for several.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+enum XrefsOutput {
+    Single(crate::ida::types::XRefListResult),
+    Batch { results: Vec<XrefsBatchEntry> },
+}
+
+/// Listing tools whose result reports a `MutationTarget`, which can carry a
+/// null database or symbol. Their schemas keep those nulls instead of being
+/// normalized, so the other tools' output contracts do not widen.
+fn reports_mutation_target(name: &str) -> bool {
+    ["list_lvars", "list_pseudocode_comments"].contains(&name)
+}
+
+/// Output schema for tools whose result is a typed object. Tools whose
+/// result is a bare array or a shape built per call advertise none.
+///
+/// MCP requires the literal root `"type": "object"`, and clients validate it
+/// before accepting the tool inventory; a union of object variants gets it
+/// added explicitly because schemars leaves the root of an `anyOf` untyped.
+fn tool_output_schema(name: &str) -> Option<Value> {
+    fn schema<T: JsonSchema>() -> Value {
+        serde_json::to_value(schema_for!(T)).unwrap_or_else(|_| json!({}))
+    }
+
+    let mut value = match name {
+        "analysis_status" => schema::<AnalysisStatusOutput>(),
+        "list_functions" => schema::<crate::ida::types::FunctionListResult>(),
+        "resolve_function" => schema::<crate::ida::types::FunctionInfo>(),
+        "function_at" => schema::<crate::ida::types::FunctionRangeInfo>(),
+        "list_lvars" => schema::<crate::ida::types::ListLvarsResult>(),
+        "list_pseudocode_comments" => schema::<crate::ida::types::ListPseudocodeCommentsResult>(),
+        "strings" => schema::<crate::ida::types::StringListResult>(),
+        "xrefs_to" | "xrefs_from" => schema::<XrefsOutput>(),
+        _ => return None,
+    };
+    if !reports_mutation_target(name) {
+        normalize_schema_value(&mut value);
+    }
+    if let Value::Object(root) = &mut value {
+        root.remove("$schema");
+        root.entry("type").or_insert_with(|| json!("object"));
+    }
+    Some(value)
 }
 
 fn tool_params_schema(name: &str) -> Option<Value> {
@@ -6464,7 +7240,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "debug_attach" => Some(schema::<DebugAttachRequest>()),
         "debug_stop" => Some(schema::<DebugStopRequest>()),
         "debug_open_module" => Some(schema::<DebugOpenModuleRequest>()),
-        "analysis_status" => Some(schema::<EmptyParams>()),
+        "analysis_status" | "save_idb" => Some(schema::<EmptyParams>()),
         "list_databases" => Some(schema::<EmptyParams>()),
         "tool_catalog" => Some(schema::<ToolCatalogRequest>()),
         "tool_help" => Some(schema::<ToolHelpRequest>()),
@@ -6473,7 +7249,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "idb_meta" => Some(schema::<EmptyParams>()),
 
         // Functions
-        "list_functions" | "list_funcs" => Some(schema::<ListFunctionsRequest>()),
+        "list_functions" => Some(schema::<ListFunctionsRequest>()),
         "resolve_function" => Some(schema::<ResolveFunctionRequest>()),
         "addr_info" => Some(schema::<AddrInfoRequest>()),
         "function_at" => Some(schema::<FunctionAtRequest>()),
@@ -6486,7 +7262,12 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "disasm_by_name" => Some(schema::<DisasmByNameRequest>()),
         "disasm_function_at" => Some(schema::<DisasmFunctionAtRequest>()),
         "decompile" => Some(schema::<DecompileRequest>()),
+        "list_lvars" => Some(schema::<ListLvarsRequest>()),
+        "rename_lvar" => Some(schema::<RenameLvarRequest>()),
+        "set_lvar_type" => Some(schema::<SetLvarTypeRequest>()),
         "pseudocode_at" => Some(schema::<PseudocodeAtRequest>()),
+        "list_pseudocode_comments" => Some(schema::<ListPseudocodeCommentsRequest>()),
+        "set_pseudocode_comment" => Some(schema::<SetPseudocodeCommentRequest>()),
 
         // Xrefs / Control flow
         "xrefs_to" | "xrefs_from" => Some(schema::<XrefsRequest>()),
@@ -6499,7 +7280,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "get_bytes" => Some(schema::<GetBytesRequest>()),
         "list_patches" => Some(schema::<ListPatchesRequest>()),
         "get_string" => Some(schema::<GetStringRequest>()),
-        "get_u8" | "get_u16" | "get_u32" | "get_u64" => Some(schema::<AddressRequest>()),
+        "read_int" => Some(schema::<ReadIntRequest>()),
         "get_global_value" => Some(schema::<GetGlobalValueRequest>()),
         "strings" => Some(schema::<StringsRequest>()),
         "find_string" => Some(schema::<FindStringRequest>()),
@@ -6516,7 +7297,6 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "lumina_lookup" => Some(schema::<LuminaLookupRequest>()),
         "lumina_apply" => Some(schema::<LuminaApplyRequest>()),
         "list_globals" => Some(schema::<ListGlobalsRequest>()),
-        "int_convert" => Some(schema::<IntConvertRequest>()),
 
         // Editing
         "set_comments" => Some(schema::<SetCommentsRequest>()),
@@ -6531,7 +7311,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "search_structs" => Some(schema::<StructsRequest>()),
         "local_types" => Some(schema::<LocalTypesRequest>()),
         "xrefs_to_field" => Some(schema::<XrefsToFieldRequest>()),
-        "stack_frame" => Some(schema::<AddressRequest>()),
+        "stack_frame" => Some(schema::<SingleAddressRequest>()),
         "declare_type" => Some(schema::<DeclareTypeRequest>()),
         "apply_types" => Some(schema::<ApplyTypesRequest>()),
         "infer_types" => Some(schema::<InferTypesRequest>()),
@@ -6710,8 +7490,8 @@ impl ServerHandler for IdaMcpServer {
         supported_protocol_versions(self.worker.is_legacy_pooled())
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tasks()
@@ -6776,6 +7556,9 @@ pub struct SanitizedIdaServer<S> {
     inner: S,
     filter: Arc<tool_filter::ToolFilter>,
     workspace: bool,
+    /// Set in child workers: a crash caught while a call ran is reported to
+    /// the parent on that call's result.
+    sdk_crash: Option<crate::crash_guard::SdkCrashSignal>,
 }
 
 impl<S> SanitizedIdaServer<S> {
@@ -6786,6 +7569,7 @@ impl<S> SanitizedIdaServer<S> {
             inner,
             filter: Arc::new(tool_filter::ToolFilter::unrestricted()),
             workspace: false,
+            sdk_crash: None,
         }
     }
 
@@ -6795,6 +7579,7 @@ impl<S> SanitizedIdaServer<S> {
             inner,
             filter,
             workspace: false,
+            sdk_crash: None,
         }
     }
 
@@ -6803,7 +7588,15 @@ impl<S> SanitizedIdaServer<S> {
             inner,
             filter,
             workspace: true,
+            sdk_crash: None,
         }
+    }
+
+    /// Report IDA SDK crashes to a pool parent on the result of the call
+    /// that was running. Used by child workers only.
+    pub fn reporting_sdk_crashes(mut self, signal: crate::crash_guard::SdkCrashSignal) -> Self {
+        self.sdk_crash = Some(signal);
+        self
     }
 }
 
@@ -6834,9 +7627,23 @@ fn tool_annotations_for(name: &str) -> ToolAnnotations {
             .destructive(true)
             .open_world(false),
         "patch" | "patch_asm" => ToolAnnotations::new().read_only(false).destructive(true),
-        "open_idb" | "open_dsc" | "dsc_add_dylib" | "dsc_add_region" | "close_idb"
-        | "load_debug_info" | "declare_type" | "apply_types" | "declare_stack" | "delete_stack"
-        | "rename" | "set_comments" | "debug_open_module" => ToolAnnotations::new()
+        "open_idb"
+        | "open_dsc"
+        | "dsc_add_dylib"
+        | "dsc_add_region"
+        | "save_idb"
+        | "close_idb"
+        | "load_debug_info"
+        | "declare_type"
+        | "apply_types"
+        | "declare_stack"
+        | "delete_stack"
+        | "rename"
+        | "rename_lvar"
+        | "set_lvar_type"
+        | "set_comments"
+        | "set_pseudocode_comment"
+        | "debug_open_module" => ToolAnnotations::new()
             .read_only(false)
             .destructive(name == "close_idb")
             .open_world(false),
@@ -6850,6 +7657,10 @@ fn tool_annotations_for(name: &str) -> ToolAnnotations {
 
 fn set_tool_metadata(tool: &mut Tool) {
     tool.annotations = Some(tool_annotations_for(&tool.name));
+    tool.output_schema = tool_output_schema(&tool.name).and_then(|schema| match schema {
+        Value::Object(object) => Some(Arc::new(object)),
+        _ => None,
+    });
 }
 
 fn apply_tool_metadata(mut tool: Tool) -> Tool {
@@ -7124,6 +7935,13 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        // rmcp may drop its argument context before polling handlers that do
+        // not take RequestContext. Keep the receive-side guard until the whole
+        // tool call settles, including close_idb and other context-free tools.
+        let _stdio_request = ctx
+            .extensions
+            .get::<crate::transport::PendingStdioRequest>()
+            .cloned();
         if tool_registry::get_tool(&params.name).is_some() && !self.filter.is_enabled(&params.name)
         {
             return Err(McpError::invalid_params(
@@ -7139,10 +7957,31 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
                 None,
             ));
         }
-        self.inner.call_tool(params, ctx).await
+        let tool = params.name.to_string();
+        let mut response = self.inner.call_tool(params, ctx).await;
+        if self.sdk_crash.is_none()
+            && let Ok(CallToolResponse::Complete(result)) = &mut response
+        {
+            crate::ida::remote::strip_result_metadata(result);
+        }
+        if !self.sdk_crash.as_ref().is_some_and(|signal| signal.take()) {
+            return response;
+        }
+        let mut result = match response {
+            Ok(CallToolResponse::Complete(result)) => result,
+            // A crash leaves no trustworthy partial state to resume or poll,
+            // so every other shape collapses to a terminal error.
+            Ok(_) | Err(_) => ToolError::SdkCrashed(format!(
+                "{tool} crashed inside the IDA SDK. The database state can no longer be \
+                 trusted; reopen it."
+            ))
+            .to_tool_result(),
+        };
+        crate::ida::remote::mark_sdk_crashed(&mut result);
+        Ok(CallToolResponse::Complete(result))
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.inner.get_info()
     }
 
@@ -7199,14 +8038,18 @@ mod tests {
         find_target_dyld_cache, is_sessionless_request_meta, materialize_task_response,
         normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
-        raw_blob_database_exists, run_script_failure_message, run_script_succeeded,
-        run_script_timeout_message, run_script_truncate_chars, runtime_module_preferred_base,
-        segment_defines_runtime_image_base, select_runtime_module, supported_protocol_versions,
-        target_dyld_cache_names, task, task_payload_result_value, task_state_to_detailed_task,
-        task_state_to_mcp_task, timeout_with_child_grace, tool_annotations_for, tool_params_schema,
-        workspace_close_should_remove_entry, workspace_tool_example, DscOpenPlan, IdaMcpServer,
-        OpenIdbBackgroundDecision, RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest,
-        ToolHelpRequest, XrefsRequest,
+        raw_blob_database_exists, reports_mutation_target, run_script_failure_message,
+        run_script_succeeded, run_script_timeout_message, run_script_truncate_chars,
+        runtime_module_preferred_base, segment_defines_runtime_image_base, select_runtime_module,
+        supported_protocol_versions, target_dyld_cache_names, task, task_payload_result_value,
+        task_state_to_detailed_task, task_state_to_mcp_task, timeout_with_child_grace,
+        tool_annotations_for, tool_params_schema, workspace_close_should_remove_entry,
+        workspace_tool_example, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
+        RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
+        XrefsRequest,
+    };
+    use crate::server::{
+        tool_output_schema, typed_result, AnalysisStatusOutput, XrefsBatchEntry, XrefsOutput,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
@@ -7285,6 +8128,652 @@ mod tests {
             Arc::new(crate::IdaWorker::new(tx)),
             crate::ServerMode::Stdio,
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_script_fifo_is_rejected_without_waiting_for_a_writer() {
+        let path = std::env::temp_dir().join(format!("ida-mcp-script-{}", uuid::Uuid::new_v4()));
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("create FIFO")
+            .success());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::server::read_script_file(path.to_str().expect("UTF-8 fixture path")),
+        )
+        .await;
+        std::fs::remove_file(&path).expect("remove owned FIFO");
+        let error = result
+            .expect("FIFO open must not block")
+            .expect_err("reject FIFO");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn private_worker_metadata_is_removed_only_at_the_public_boundary() {
+        use rmcp::model::{CallToolRequestParams, ClientConfig, ServerCapabilities, ServerConfig};
+        use rmcp::service::{RequestContext, RoleServer};
+        use rmcp::{ErrorData, ServiceExt as _};
+
+        struct MetadataServer;
+        impl ServerHandler for MetadataServer {
+            fn get_info(&self) -> ServerConfig {
+                ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            }
+
+            async fn call_tool(
+                &self,
+                _params: CallToolRequestParams,
+                _ctx: RequestContext<RoleServer>,
+            ) -> Result<CallToolResponse, ErrorData> {
+                let mut result = CallToolResult::success(vec![]);
+                result.meta = Some(
+                    serde_json::from_value(json!({
+                        "ida-mcp/sdk-crashed": true,
+                        "public": "retained"
+                    }))
+                    .expect("metadata"),
+                );
+                Ok(CallToolResponse::Complete(result))
+            }
+        }
+
+        for worker in [false, true] {
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let mut server = crate::server::SanitizedIdaServer::new(MetadataServer);
+            if worker {
+                server =
+                    server.reporting_sdk_crashes(crate::crash_guard::SdkCrashSignal::default());
+            }
+            let serving = tokio::spawn(async move { server.serve(server_io).await });
+            let mut client = ClientConfig::default()
+                .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
+                .serve(client_io)
+                .await
+                .expect("client handshake");
+            let mut server = serving
+                .await
+                .expect("server task")
+                .expect("server handshake");
+            let result = client
+                .call_tool(CallToolRequestParams::new("metadata_probe"))
+                .await
+                .expect("tool response");
+            let meta = result.meta.expect("public metadata remains");
+            assert_eq!(meta.0.get("public"), Some(&json!("retained")));
+            assert_eq!(meta.0.contains_key("ida-mcp/sdk-crashed"), worker);
+            client.close().await.expect("close client");
+            server.close().await.expect("close server");
+        }
+    }
+
+    /// One-result tools refuse several addresses instead of answering for the
+    /// first and dropping the rest; a one-element array still works.
+    #[tokio::test]
+    async fn one_result_tools_refuse_multiple_addresses() {
+        let server = test_server();
+        let two = json!(["0x1000", "0x2000"]);
+
+        let function_at = server
+            .function_at(Parameters(crate::server::FunctionAtRequest {
+                address: Some(two.clone()),
+                target_name: None,
+                offset: None,
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(function_at.is_error, Some(true));
+        let text = first_text(&function_at);
+        assert!(
+            text.contains("exactly one address") && text.contains("got 2"),
+            "{text}"
+        );
+
+        let addr_info = server
+            .addr_info(Parameters(crate::server::AddrInfoRequest {
+                address: Some(two),
+                target_name: None,
+                offset: None,
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(addr_info.is_error, Some(true));
+        assert!(first_text(&addr_info).contains("got 2"));
+
+        // A one-element array is the scalar; it reaches the worker (which this
+        // test server never answers), so the result is not a parameter error.
+        let one = json!(["0x1000"]);
+        let outcome = IdaMcpServer::value_to_exactly_one_address(&one, "address");
+        assert_eq!(outcome.ok(), Some(0x1000));
+        let empty = IdaMcpServer::value_to_exactly_one_address(&json!([]), "address");
+        assert!(empty
+            .unwrap_err()
+            .to_string()
+            .contains("no addresses provided"));
+    }
+
+    /// What the agent reads must say which address parameters take arrays.
+    #[test]
+    fn address_descriptions_state_batch_or_single() {
+        let batch = [
+            "disasm",
+            "decompile",
+            "pseudocode_at",
+            "get_bytes",
+            "basic_blocks",
+            "callees",
+            "callers",
+            "callgraph",
+            "read_struct",
+            "read_int",
+            "get_string",
+            "xrefs_to",
+            "xrefs_from",
+        ];
+        let single = [
+            "addr_info",
+            "function_at",
+            "disasm_function_at",
+            "stack_frame",
+            "infer_types",
+        ];
+        let server = crate::server::SanitizedIdaServer::new(test_server());
+        for name in batch {
+            let tool = server.get_tool(name).expect(name);
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("one or more") || description.contains("(es)"),
+                "{name} tools/list description hides its batch support: {description}"
+            );
+            let short = crate::tool_registry::get_tool(name).expect(name).short_desc;
+            assert!(
+                short.contains("one or more")
+                    || short.contains("(es)")
+                    || short.contains("addresses"),
+                "{name} catalog description hides its batch support: {short}"
+            );
+        }
+        for name in single {
+            let tool = server.get_tool(name).expect(name);
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("one address"),
+                "{name} tools/list description does not say it takes one address: {description}"
+            );
+            let schema_text = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+            assert!(
+                !schema_text.contains("Address(es)"),
+                "{name} parameter schema advertises batch input: {schema_text}"
+            );
+            assert!(
+                crate::tool_registry::get_tool(name)
+                    .expect(name)
+                    .short_desc
+                    .contains("one "),
+                "{name} catalog description does not say it takes one address"
+            );
+        }
+    }
+
+    /// Addresses parse with digit separators; a symbol in an address slot is
+    /// named as such, with the original spelling, and pointed at the fix.
+    #[test]
+    fn bad_addresses_are_explained_in_the_callers_terms() {
+        assert_eq!(
+            IdaMcpServer::parse_address("0x1000_0660").unwrap(),
+            0x1000_0660
+        );
+        assert_eq!(IdaMcpServer::parse_address(" 4096 ").unwrap(), 4096);
+        assert_eq!(IdaMcpServer::parse_address("0b101").unwrap(), 5);
+        assert_eq!(IdaMcpServer::parse_address("0o17").unwrap(), 15);
+
+        let symbol = IdaMcpServer::parse_address("helper_mix")
+            .unwrap_err()
+            .to_string();
+        assert!(symbol.contains("\"helper_mix\""), "{symbol}");
+        assert!(symbol.contains("symbol name"), "{symbol}");
+        assert!(symbol.contains("resolve_function"), "{symbol}");
+        assert!(!symbol.contains("helpermix"), "{symbol}");
+
+        let junk = IdaMcpServer::parse_address("0xZZ").unwrap_err().to_string();
+        assert!(
+            junk.contains("\"0xZZ\"") && junk.contains("not a hex"),
+            "{junk}"
+        );
+    }
+
+    /// Every advertised output schema carries MCP's required root object
+    /// type, and the handler's structured content equals its text and
+    /// validates against that schema, so the three views cannot drift apart.
+    #[test]
+    fn output_schemas_match_the_structured_results() {
+        use crate::ida::types::{
+            AnalysisStatus, FunctionInfo, FunctionListResult, FunctionRangeInfo, ListLvarsResult,
+            ListPseudocodeCommentsResult, LocalVariableInfo, MutationTarget, PseudocodeCommentInfo,
+            StringInfo, StringListResult, TargetSelector, XRefInfo, XRefListResult,
+        };
+
+        let advertised: Vec<&str> = crate::tool_registry::all_tools()
+            .map(|tool| tool.name)
+            .filter(|name| tool_output_schema(name).is_some())
+            .collect();
+        assert_eq!(
+            advertised,
+            [
+                "analysis_status",
+                "list_functions",
+                "resolve_function",
+                "function_at",
+                "list_lvars",
+                "list_pseudocode_comments",
+                "xrefs_to",
+                "xrefs_from",
+                "strings",
+            ]
+        );
+        for name in &advertised {
+            let schema = tool_output_schema(name).expect("schema");
+            // MCP's Tool.outputSchema requires this literal root property;
+            // the TypeScript SDK rejects the whole inventory without it.
+            assert_eq!(
+                schema["type"], "object",
+                "{name} output schema lacks a root type: {schema}"
+            );
+            assert!(!contains_schema_key(&schema), "{name} schema keeps $schema");
+            if !reports_mutation_target(name) {
+                let mut normalized = schema.clone();
+                normalize_schema_value(&mut normalized);
+                assert_eq!(schema, normalized, "{name} widened its output schema");
+            }
+        }
+
+        let function = FunctionInfo {
+            address: "0x1000".into(),
+            name: "_main".into(),
+            size: 32,
+        };
+        let listing = XRefListResult {
+            xrefs: vec![XRefInfo {
+                from: "0x1000".into(),
+                to: "0x2000".into(),
+                r#type: "call".into(),
+                is_code: true,
+            }],
+            truncated: false,
+            next_offset: None,
+        };
+        let target = MutationTarget {
+            database: None,
+            selector: TargetSelector::Address,
+            symbol: None,
+            base: "0x1000".into(),
+            requested_address: "0x1004".into(),
+            address: "0x1000".into(),
+        };
+        let variable = LocalVariableInfo {
+            name: "v1".into(),
+            type_name: "int".into(),
+            location: "w0".into(),
+            locator: Some("opaque-local-locator".into()),
+            definition_address: None,
+            size: Some(4),
+            is_argument: true,
+            has_user_name: false,
+            has_user_type: false,
+        };
+        let results = [
+            (
+                "analysis_status",
+                typed_result(&AnalysisStatusOutput {
+                    status: AnalysisStatus {
+                        auto_enabled: true,
+                        auto_is_ok: true,
+                        auto_state: "idle".into(),
+                        auto_state_id: 0,
+                        analysis_running: false,
+                    },
+                    session_id: Some("s1".into()),
+                }),
+            ),
+            (
+                "list_functions",
+                typed_result(&FunctionListResult {
+                    functions: vec![function.clone()],
+                    total: 1,
+                    next_offset: Some(1),
+                }),
+            ),
+            (
+                "list_functions",
+                typed_result(&FunctionListResult {
+                    functions: vec![],
+                    total: 0,
+                    next_offset: None,
+                }),
+            ),
+            ("resolve_function", typed_result(&function)),
+            (
+                "function_at",
+                typed_result(&FunctionRangeInfo {
+                    address: "0x1000".into(),
+                    name: "_main".into(),
+                    start: "0x1000".into(),
+                    end: "0x1020".into(),
+                    size: 32,
+                }),
+            ),
+            (
+                "list_lvars",
+                typed_result(&ListLvarsResult {
+                    target: target.clone(),
+                    lvars: vec![variable],
+                    total: 1,
+                    next_offset: None,
+                }),
+            ),
+            (
+                "list_pseudocode_comments",
+                typed_result(&ListPseudocodeCommentsResult {
+                    target,
+                    locations: vec![PseudocodeCommentInfo {
+                        locator: "pcmt1:950:1000:1004:4a".into(),
+                        address: "0x1004".into(),
+                        line_number: 7,
+                        text: "  else".into(),
+                        comment: String::new(),
+                    }],
+                    total: 3,
+                    next_offset: Some(1),
+                }),
+            ),
+            (
+                "xrefs_to",
+                typed_result(&XrefsOutput::Single(listing.clone())),
+            ),
+            (
+                "xrefs_from",
+                typed_result(&XrefsOutput::Batch {
+                    results: vec![
+                        XrefsBatchEntry::Listing {
+                            address: "0x1000".into(),
+                            listing,
+                        },
+                        XrefsBatchEntry::Error {
+                            address: "0x3000".into(),
+                            error: "not found".into(),
+                        },
+                    ],
+                }),
+            ),
+            (
+                "strings",
+                typed_result(&StringListResult {
+                    strings: vec![StringInfo {
+                        address: "0x4000".into(),
+                        content: "hello".into(),
+                        length: 5,
+                    }],
+                    total: 1,
+                    next_offset: None,
+                }),
+            ),
+        ];
+        for (tool, result) in results {
+            let structured = result
+                .structured_content
+                .clone()
+                .expect("structured content");
+            let text: Value = serde_json::from_str(&first_text(&result)).expect("text is JSON");
+            assert_eq!(structured, text, "{tool}: text and structured views differ");
+            let schema = tool_output_schema(tool).expect("schema");
+            let validator = jsonschema::validator_for(&schema).expect("valid schema");
+            let errors: Vec<String> = validator
+                .iter_errors(&structured)
+                .map(|error| error.to_string())
+                .collect();
+            assert!(
+                errors.is_empty(),
+                "{tool} result violates its schema: {errors:?}"
+            );
+        }
+
+        // A batch entry is either a listing or an error, never both or
+        // neither; the schema enforces that, not just the handler.
+        let schema = tool_output_schema("xrefs_to").expect("schema");
+        let validator = jsonschema::validator_for(&schema).expect("valid schema");
+        for invalid in [
+            json!({"results": [{"address": "0x1", "error": "x", "xrefs": [], "truncated": false}]}),
+            json!({"results": [{"address": "0x1"}]}),
+        ] {
+            assert!(!validator.is_valid(&invalid), "schema accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn decompiler_edit_annotations_match_their_effects() {
+        for (name, read_only) in [
+            ("list_lvars", true),
+            ("rename_lvar", false),
+            ("set_lvar_type", false),
+            ("list_pseudocode_comments", true),
+            ("set_pseudocode_comment", false),
+        ] {
+            assert_eq!(
+                tool_annotations_for(name).read_only_hint,
+                Some(read_only),
+                "{name}"
+            );
+        }
+    }
+
+    /// A server whose worker answers from `respond` on a helper thread, so a
+    /// handler can be driven through a scripted sequence of worker replies.
+    fn scripted_server(
+        respond: impl Fn(crate::IdaRequest) + Send + 'static,
+    ) -> (IdaMcpServer, std::thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let worker = std::thread::spawn(move || {
+            while let Ok(request) = rx.recv() {
+                respond(request);
+            }
+        });
+        let server = IdaMcpServer::new(
+            Arc::new(crate::IdaWorker::new(tx)),
+            crate::ServerMode::Stdio,
+        );
+        (server, worker)
+    }
+
+    /// A DSC load that succeeds, followed by a status request that reports
+    /// the worker's loss. Any other request is unexpected.
+    fn load_then_lose_worker(request: crate::IdaRequest) {
+        match request {
+            crate::IdaRequest::DscLoadImage {
+                admission, resp, ..
+            } => {
+                let _ = admission.start();
+                let _ = resp.send(Ok(crate::ida::types::DscImageInfo {
+                    index: 1,
+                    name: "/usr/lib/libSystem.B.dylib".to_string(),
+                    file_name: "libSystem.B.dylib".to_string(),
+                    address: "0x180000000".to_string(),
+                    address_value: 0x1_8000_0000,
+                    total_size: 0x1000,
+                    file_index: None,
+                    loaded: true,
+                }));
+            }
+            crate::IdaRequest::DscLoadRegion {
+                admission, resp, ..
+            } => {
+                let _ = admission.start();
+                let _ = resp.send(Ok(crate::ida::types::DscRegionInfo {
+                    start: "0x180000000".to_string(),
+                    start_value: 0x1_8000_0000,
+                    size: 0x1000,
+                    kind: "text".to_string(),
+                    image_index: 1,
+                    name: "libSystem".to_string(),
+                    loaded: true,
+                }));
+            }
+            crate::IdaRequest::AnalysisStatus { resp, .. } => {
+                let _ = resp.send(Err(ToolError::SdkCrashed(
+                    "analysis_status crashed inside the IDA SDK".to_string(),
+                )));
+            }
+            _ => panic!("unexpected worker request"),
+        }
+    }
+
+    fn first_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// The post-load status request is optional, but a fatal error there
+    /// means the database was discarded, so the load must not report success.
+    #[tokio::test]
+    async fn dsc_growth_reports_a_lost_worker_instead_of_success() {
+        let (server, _worker) = scripted_server(load_then_lose_worker);
+
+        let dylib = server
+            .dsc_add_dylib(Parameters(crate::server::DscAddDylibRequest {
+                module: "/usr/lib/libSystem.B.dylib".to_string(),
+                timeout_secs: Some(5),
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(dylib.is_error, Some(true), "{dylib:?}");
+        assert!(first_text(&dylib).contains("crashed inside the IDA SDK"));
+
+        let region = server
+            .dsc_add_region(Parameters(crate::server::DscAddRegionRequest {
+                address: json!("0x180000000"),
+                timeout_secs: Some(5),
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(region.is_error, Some(true), "{region:?}");
+        assert!(first_text(&region).contains("crashed inside the IDA SDK"));
+    }
+
+    #[tokio::test]
+    async fn background_dsc_preserves_fatal_loss_at_each_cancel_boundary() {
+        use crate::ida::types::{
+            AnalysisStatus, DatabaseGeneration, DbInfo, DscImageInfo, OpenedDatabase,
+        };
+        use crate::server::{DscBackgroundCtx, DscBackgroundOpen};
+
+        for phase in ["open", "module", "framework", "status"] {
+            let directory = std::env::temp_dir()
+                .join(format!("ida-mcp-dsc-fatal-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).expect("create test directory");
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let worker_cancel = cancel.clone();
+            let message = format!("{phase} lost the IDA worker");
+            let worker_message = message.clone();
+            let (server, worker_thread) = scripted_server(move |request| {
+                let fatal = || {
+                    worker_cancel.cancel();
+                    ToolError::SdkCrashed(worker_message.clone())
+                };
+                match request {
+                    crate::IdaRequest::Open { path, resp, .. } => {
+                        let result = if phase == "open" {
+                            Err(fatal())
+                        } else {
+                            Ok(OpenedDatabase {
+                                generation: DatabaseGeneration(1),
+                                info: DbInfo {
+                                    path,
+                                    file_type: "DSC".into(),
+                                    loader: "DSC".into(),
+                                    processor: "ARM".into(),
+                                    bits: 64,
+                                    function_count: 0,
+                                    debug_info: None,
+                                    analysis_status: AnalysisStatus {
+                                        auto_enabled: true,
+                                        auto_is_ok: false,
+                                        auto_state: "AU_NONE".into(),
+                                        auto_state_id: 0,
+                                        analysis_running: true,
+                                    },
+                                },
+                            })
+                        };
+                        resp.send(result).expect("return open result");
+                    }
+                    crate::IdaRequest::DscLoadImage {
+                        module,
+                        admission,
+                        resp,
+                        ..
+                    } => {
+                        admission.start().expect("dispatch image load");
+                        let result = if module == phase {
+                            Err(fatal())
+                        } else {
+                            Ok(DscImageInfo {
+                                index: 0,
+                                name: module.clone(),
+                                file_name: module,
+                                address: "0x1000".into(),
+                                address_value: 0x1000,
+                                total_size: 0x1000,
+                                file_index: None,
+                                loaded: true,
+                            })
+                        };
+                        resp.send(result).expect("return image result");
+                    }
+                    crate::IdaRequest::AnalysisStatus { resp, .. } => {
+                        assert_eq!(phase, "status");
+                        resp.send(Err(fatal())).expect("return status error");
+                    }
+                    _ => panic!("fatal worker loss must not dispatch cleanup"),
+                }
+            });
+            let registry = server.task_registry.clone();
+            let id = registry
+                .create_keyed(&TASK_OWNER, "dsc", "cancel-boundary", "Opening DSC")
+                .expect("create task");
+            IdaMcpServer::run_dsc_background(
+                id.clone(),
+                registry.clone(),
+                server.worker.clone(),
+                crate::ServerMode::Stdio,
+                None,
+                DscBackgroundCtx {
+                    open: DscBackgroundOpen::DirectRawDsc {
+                        open_path: directory.join("cache"),
+                        idb_out: directory.join("cache.i64"),
+                    },
+                    module: "module".into(),
+                    frameworks: vec!["framework".into()],
+                    owner_session_id: None,
+                },
+                cancel,
+            )
+            .await;
+            let value = serde_json::to_value(task_state_to_detailed_task(
+                registry.get(&id).expect("retained DSC task"),
+            ))
+            .expect("serialize MCP task");
+            assert_eq!(value["status"], "completed", "{phase}: {value}");
+            assert_eq!(value["result"]["isError"], true, "{phase}: {value}");
+            assert_eq!(value["result"]["content"][0]["text"], message);
+            drop(server);
+            worker_thread.join().expect("scripted worker exited");
+            std::fs::remove_dir_all(directory).expect("remove test directory");
+        }
     }
 
     /// Sentinels chosen so a substring hit can only come from the payload we
@@ -8228,6 +9717,15 @@ mod tests {
     }
 
     #[test]
+    fn save_annotation_agrees_with_read_only_filter() {
+        assert!(crate::server::tool_filter::READ_ONLY_DENY_LIST.contains(&"save_idb"));
+        let save = tool_annotations_for("save_idb");
+        assert_eq!(save.read_only_hint, Some(false));
+        assert_eq!(save.destructive_hint, Some(false));
+        assert_ne!(save.idempotent_hint, Some(true));
+    }
+
+    #[test]
     fn debugger_annotations_match_process_and_filesystem_effects() {
         let stop = tool_annotations_for("debug_stop");
         assert_eq!(stop.read_only_hint, Some(false));
@@ -8338,7 +9836,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "59568456bad624fc92694542ec5ba9d67f59b42b6134ef91f17af9c6a5d975b9"
+            "b3471fa79a0b10935aa2f17d4441548867f9aecd6e22c9db1d121ad1ee50e037"
         );
     }
 
@@ -8498,26 +9996,150 @@ mod tests {
         assert_eq!(value["result"]["isError"], false);
     }
 
+    #[tokio::test]
+    async fn background_analysis_preserves_fatal_loss_after_cancellation() {
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let server = IdaMcpServer::new(
+            Arc::new(crate::IdaWorker::new(tx)),
+            crate::ServerMode::Stdio,
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let id = server
+            .spawn_analyze_funcs_task(&task::TaskOwner::Runtime, cancel.clone())
+            .expect("start background analysis");
+        let request = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .expect("join request receiver")
+            .expect("analysis reached the worker");
+        let crate::IdaRequest::AnalyzeFuncs {
+            admission, resp, ..
+        } = request
+        else {
+            panic!("unexpected worker request");
+        };
+        admission.start().expect("dispatch analysis");
+        assert!(server
+            .task_registry
+            .cancel_for_owner(&task::TaskOwner::Runtime, &id));
+        assert!(cancel.is_cancelled());
+        let error = ToolError::WorkerRetired(
+            "cancelled analyze_funcs; killed worker 7. The database is no longer open; call open_idb again"
+                .to_string(),
+        );
+        let expected = error.to_string();
+        resp.send(Err(error)).expect("return worker retirement");
+
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = server.task_registry.get(&id).expect("retained task");
+                if state.status != task::TaskStatus::Running {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("analysis task settled");
+        let value =
+            serde_json::to_value(task_state_to_detailed_task(state)).expect("serialize MCP task");
+        assert_eq!(value["status"], "completed", "{value}");
+        assert_eq!(value["result"]["isError"], true, "{value}");
+        assert_eq!(value["result"]["content"][0]["text"], expected);
+    }
+
+    #[test]
+    fn background_tool_errors_preserve_only_typed_fatal_losses() {
+        for (error, fatal) in [
+            (ToolError::WorkerRetired("worker retired".into()), true),
+            (
+                ToolError::WorkerCrashed {
+                    worker_id: 7,
+                    last_op: "analyze_funcs".into(),
+                },
+                true,
+            ),
+            (ToolError::SdkCrashed("SDK crashed".into()), true),
+            (ToolError::DebuggerSessionLost("session lost".into()), true),
+            (ToolError::NeverDispatched("still queued".into()), false),
+            (ToolError::Cancelled("cancelled".into()), false),
+            (ToolError::IdaError("worker retired".into()), false),
+        ] {
+            let registry = task::TaskRegistry::new();
+            let id = registry
+                .create_keyed(&TASK_OWNER, "test", "fatal-settlement", "Working")
+                .expect("create task");
+            let cancel = tokio_util::sync::CancellationToken::new();
+            registry.set_cancel_token(&id, cancel.clone());
+            assert!(registry.cancel_for_owner(&TASK_OWNER, &id));
+            assert!(cancel.is_cancelled());
+            let expected = if fatal {
+                task::TaskSettlement::Completed
+            } else {
+                task::TaskSettlement::Cancelled
+            };
+            assert_eq!(
+                IdaMcpServer::complete_background_tool_error(
+                    &id,
+                    &registry,
+                    &error,
+                    &cancel,
+                    "Cancelled after work settled",
+                ),
+                expected,
+                "{error:?}"
+            );
+            let state = registry.get(&id).expect("retained task");
+            if fatal {
+                assert_eq!(
+                    state.result,
+                    Some(call_tool_result_to_value(&error.to_tool_result()))
+                );
+            } else {
+                assert!(state.result.is_none());
+            }
+        }
+    }
+
     #[test]
     fn tool_error_is_a_completed_task_result_not_a_json_rpc_failure() {
-        let registry = crate::server::task::TaskRegistry::new();
-        let id = registry
-            .create_keyed(&TASK_OWNER, "dsc", "tool-error", "Opening DSC")
-            .expect("create task");
-        let error_result =
-            ToolError::OpenFailed("idat exited with code 4".to_string()).to_tool_result();
-        registry.complete(&id, call_tool_result_to_value(&error_result));
-
-        let state = registry.get(&id).expect("task state");
-        let value =
-            serde_json::to_value(task_state_to_detailed_task(state)).expect("serialize task");
-
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["result"]["isError"], true);
-        assert!(value["result"]["content"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("idat exited with code 4")));
-        assert!(value.get("error").is_none());
+        for (error, message) in [
+            (
+                ToolError::OpenFailed("idat exited with code 4".into()),
+                "idat exited with code 4",
+            ),
+            (
+                ToolError::RemoteCall(rmcp::ErrorData::invalid_params(
+                    "request rejected",
+                    Some(json!({"private": "worker-private-data"})),
+                )),
+                "request rejected",
+            ),
+        ] {
+            let registry = crate::server::task::TaskRegistry::new();
+            let id = registry
+                .create_keyed(&TASK_OWNER, "dsc", "tool-error", "Opening DSC")
+                .expect("create task");
+            IdaMcpServer::complete_background_tool_error(
+                &id,
+                &registry,
+                &error,
+                &tokio_util::sync::CancellationToken::new(),
+                "Cancelled after work settled",
+            );
+            let state = registry.get(&id).expect("task state");
+            let value =
+                serde_json::to_value(task_state_to_detailed_task(state)).expect("serialize task");
+            assert_eq!(value["status"], "completed");
+            assert_eq!(value["result"]["isError"], true);
+            assert!(value["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(message)));
+            assert!(value.get("error").is_none());
+            assert!(value["result"].get("_meta").is_none());
+            assert!(!value.to_string().contains("worker-private-data"));
+        }
     }
 
     #[test]
@@ -8774,13 +10396,26 @@ mod tests {
         ));
     }
 
+    fn mrtr_prompts(
+        request_state: Option<String>,
+        input_responses: Option<InputResponses>,
+    ) -> crate::server::OpenPrompts {
+        crate::server::OpenPrompts {
+            request_state,
+            input_responses,
+            timeout_secs: None,
+            background_prompt: true,
+            form_elicitation: true,
+        }
+    }
+
     #[test]
     fn modern_open_idb_mrtr_is_bound_and_integrity_checked() {
         let server = test_server();
         let path = "/tmp/large-macho";
         let size = crate::server::OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES + 1;
         let first = server
-            .modern_open_idb_background_decision(path, size, None, None)
+            .modern_open_idb_background_decision(path, size, &mut mrtr_prompts(None, None))
             .expect("first MRTR round");
         let OpenIdbBackgroundDecision::InputRequired(input_required) = first else {
             panic!("first round must request input");
@@ -8803,8 +10438,7 @@ mod tests {
             .modern_open_idb_background_decision(
                 path,
                 size,
-                Some(request_state.clone()),
-                Some(responses),
+                &mut mrtr_prompts(Some(request_state.clone()), Some(responses)),
             )
             .expect("valid retry");
         assert!(matches!(retry, OpenIdbBackgroundDecision::Ready(true)));
@@ -8813,16 +10447,17 @@ mod tests {
             .modern_open_idb_background_decision(
                 "/tmp/different-macho",
                 size,
-                Some(request_state.clone()),
-                Some(InputResponses::new()),
+                &mut mrtr_prompts(Some(request_state.clone()), Some(InputResponses::new())),
             )
             .is_err());
         assert!(server
             .modern_open_idb_background_decision(
                 path,
                 size,
-                Some(format!("{request_state}tampered")),
-                Some(InputResponses::new()),
+                &mut mrtr_prompts(
+                    Some(format!("{request_state}tampered")),
+                    Some(InputResponses::new()),
+                ),
             )
             .is_err());
     }
@@ -8833,7 +10468,7 @@ mod tests {
         let path = "/tmp/large-macho";
         let size = crate::server::OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES + 1;
         let first = server
-            .modern_open_idb_background_decision(path, size, None, None)
+            .modern_open_idb_background_decision(path, size, &mut mrtr_prompts(None, None))
             .expect("first MRTR round");
         let OpenIdbBackgroundDecision::InputRequired(input_required) = first else {
             panic!("first round must request input");
@@ -8844,8 +10479,7 @@ mod tests {
             .modern_open_idb_background_decision(
                 path,
                 size,
-                input_required.request_state,
-                Some(responses),
+                &mut mrtr_prompts(input_required.request_state, Some(responses)),
             )
             .expect("valid decline");
 
@@ -8977,5 +10611,121 @@ mod tests {
         assert!(!map.contains_key("close_token"));
         assert!(!map.contains_key("close_owner_session_id"));
         assert!(!map.contains_key("close_recovery_hint"));
+    }
+
+    fn universal_slices() -> Vec<crate::macho_fat::FatSlice> {
+        vec![
+            crate::macho_fat::FatSlice {
+                arch: "x86_64".to_string(),
+                offset: 0x4000,
+                size: 60 * 1024 * 1024,
+            },
+            crate::macho_fat::FatSlice {
+                arch: "arm64e".to_string(),
+                offset: 0x400_0000,
+                size: 4096,
+            },
+        ]
+    }
+
+    fn elicit_result(value: Value) -> rmcp::model::ElicitResult {
+        serde_json::from_value(value).expect("elicit result")
+    }
+
+    fn slice_form(ask_background: bool) -> Value {
+        let form =
+            crate::server::universal_slice_form("/x/ls", &universal_slices(), ask_background)
+                .expect("slice form");
+        serde_json::to_value(form).expect("form json")
+    }
+
+    #[test]
+    fn slice_prompt_adds_the_background_question_only_when_asked() {
+        let form = slice_form(false);
+        let schema = &form["requestedSchema"];
+        assert_eq!(schema["required"], json!(["arch"]));
+        let consts: Vec<_> = schema["properties"]["arch"]["oneOf"]
+            .as_array()
+            .expect("titled enum")
+            .iter()
+            .map(|option| option["const"].clone())
+            .collect();
+        assert_eq!(consts, [json!("x86_64"), json!("arm64e")]);
+        assert!(schema["properties"].get("background").is_none(), "{schema}");
+        let message = form["message"].as_str().expect("message");
+        assert!(message.contains("2 slices (x86_64, arm64e)"), "{message}");
+
+        let form = slice_form(true);
+        let background_schema = crate::server::background_choice_schema().expect("schema");
+        assert_eq!(
+            form["requestedSchema"]["properties"]["background"],
+            serde_json::to_value(&background_schema.properties["background"]).expect("json"),
+            "the slice prompt must ask the background question exactly as its own prompt does"
+        );
+        let message = form["message"].as_str().expect("message");
+        assert!(message.contains("background task"), "{message}");
+    }
+
+    #[test]
+    fn slice_answers_pick_a_listed_slice_or_say_why_not() {
+        let slices = universal_slices();
+        let answer = |value, ask_background| {
+            crate::server::slice_answer_from(elicit_result(value), &slices, ask_background)
+                .map(|(slice, background)| (slice.arch, background))
+        };
+        assert_eq!(
+            answer(
+                json!({"action": "accept", "content": {"arch": "ARM64E"}}),
+                false
+            ),
+            Ok(("arm64e".to_string(), None))
+        );
+        assert_eq!(
+            answer(
+                json!({"action": "accept", "content": {"arch": "x86_64"}}),
+                true
+            ),
+            Ok(("x86_64".to_string(), Some(true))),
+            "an omitted background answer means background, as in the background prompt"
+        );
+        assert_eq!(
+            answer(
+                json!({"action": "accept", "content": {"arch": "x86_64", "background": false}}),
+                true
+            ),
+            Ok(("x86_64".to_string(), Some(false)))
+        );
+        let reason = |value| answer(value, false).expect_err("no slice");
+        assert_eq!(
+            reason(json!({"action": "accept", "content": {"arch": "arm64"}})),
+            "no arm64 slice"
+        );
+        assert!(reason(json!({"action": "accept", "content": {}})).contains("did not name a slice"));
+        assert!(reason(json!({"action": "decline"})).contains("declined"));
+        assert!(reason(json!({"action": "cancel"})).contains("declined"));
+    }
+
+    #[test]
+    fn mutation_targets_take_exactly_one_selector() {
+        let target = |address: Option<Value>, name: Option<&str>| {
+            IdaMcpServer::mutation_target_address(address.as_ref(), name, "target_name")
+        };
+        assert_eq!(target(Some(json!("0x10")), None).ok(), Some(Some(0x10)));
+        assert_eq!(target(None, Some("_main")).ok(), Some(None));
+
+        let rejected = |address: Option<Value>, name: Option<&str>| {
+            target(address, name)
+                .expect_err("must be rejected")
+                .to_string()
+        };
+        assert!(rejected(Some(json!("0x10")), Some("_main")).contains("not both"));
+        assert!(rejected(None, None).contains("pass address or target_name"));
+        assert!(rejected(None, Some("")).contains("must not be empty"));
+        for several in [json!(["0x10", "0x20"]), json!("0x10, 0x20")] {
+            assert!(
+                rejected(Some(several), None).contains("exactly one address"),
+                "multi-address input must not be truncated to its first entry"
+            );
+        }
     }
 }

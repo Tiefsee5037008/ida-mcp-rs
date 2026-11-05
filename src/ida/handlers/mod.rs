@@ -12,12 +12,14 @@ pub mod functions;
 pub mod globals;
 pub mod imports;
 pub mod lumina;
+pub mod lvars;
 pub mod memory;
 pub mod script;
 pub mod search;
 pub mod segments;
 pub mod strings;
 pub mod structs;
+pub mod target;
 pub mod types;
 pub mod xrefs;
 
@@ -46,6 +48,16 @@ pub(crate) fn parse_address_str(s: &str) -> Result<u64, ToolError> {
 /// Try to parse an address string, returning None on failure.
 pub(crate) fn try_parse_address(s: &str) -> Option<u64> {
     parse_address_str(s).ok()
+}
+
+/// Reject empty, oversized, or NUL-containing text before it reaches IDA.
+pub(crate) fn checked_text(value: &str, field: &str, max: usize) -> Result<(), ToolError> {
+    if value.is_empty() || value.len() > max || value.contains('\0') {
+        return Err(ToolError::InvalidParams(format!(
+            "{field} must contain 1–{max} bytes and no NUL"
+        )));
+    }
+    Ok(())
 }
 
 /// Encode bytes as hex string.

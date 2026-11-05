@@ -32,9 +32,9 @@ pub struct OpenIdbRequest {
     )]
     pub idb_out: Option<String>,
     #[schemars(
-        description = "IDA file-type selector (-T). Raw binaries only. Empty strings are ignored."
+        description = "Slice to analyze when path is a universal (fat) Mach-O, e.g. arm64e or x86_64. The slice is copied to <input name>.<arch> beside the output database and opened as a single-architecture Mach-O. Omit it to be asked when the client supports input requests; otherwise the error lists the slices. A thin Mach-O accepts only its own arch."
     )]
-    pub file_type: Option<String>,
+    pub arch: Option<String>,
     #[schemars(
         description = "IDA processor selector for a raw blob, including an explicit variant for multi-mode families (for example arm:ARMv7-M or metapc:80386p)."
     )]
@@ -70,8 +70,8 @@ impl OpenIdbRequest {
         non_empty_trimmed(self.debug_info_path.as_deref())
     }
 
-    pub fn normalized_file_type(&self) -> Option<String> {
-        non_empty_trimmed(self.file_type.as_deref())
+    pub fn normalized_arch(&self) -> Option<String> {
+        non_empty_trimmed(self.arch.as_deref())
     }
 
     pub fn normalized_processor(&self) -> Option<String> {
@@ -119,7 +119,7 @@ rmcp::elicit_safe!(OpenIdbBackgroundChoice);
 mod tests {
     use crate::server::requests::OpenIdbRequest;
 
-    fn open_request(debug_info_path: Option<&str>, file_type: Option<&str>) -> OpenIdbRequest {
+    fn open_request(debug_info_path: Option<&str>) -> OpenIdbRequest {
         OpenIdbRequest {
             path: "/tmp/sample".to_string(),
             load_debug_info: None,
@@ -128,7 +128,7 @@ mod tests {
             force: None,
             rebuild: None,
             idb_out: None,
-            file_type: file_type.map(str::to_string),
+            arch: None,
             processor: None,
             bitness: None,
             base_address: None,
@@ -142,26 +142,24 @@ mod tests {
 
     #[test]
     fn open_idb_empty_optional_strings_are_ignored() {
-        let req = open_request(Some(" \t "), Some(""));
+        let req = open_request(Some(" \t "));
         assert_eq!(req.normalized_debug_info_path(), None);
-        assert_eq!(req.normalized_file_type(), None);
     }
 
     #[test]
     fn open_idb_optional_strings_are_trimmed() {
-        let mut req = open_request(Some(" C:\\symbols\\sample.pdb "), Some(" pe "));
+        let mut req = open_request(Some(" C:\\symbols\\sample.pdb "));
         req.processor = Some(" arm:ARMv7-M ".to_string());
         assert_eq!(
             req.normalized_debug_info_path(),
             Some("C:\\symbols\\sample.pdb".to_string())
         );
-        assert_eq!(req.normalized_file_type(), Some("pe".to_string()));
         assert_eq!(req.normalized_processor(), Some("arm:ARMv7-M".to_string()));
     }
 
     #[test]
     fn open_idb_output_path_is_trimmed_and_empty_is_ignored() {
-        let mut req = open_request(None, None);
+        let mut req = open_request(None);
         req.idb_out = Some("  /tmp/output.i64  ".to_string());
         assert_eq!(
             req.normalized_idb_out(),
@@ -174,7 +172,7 @@ mod tests {
 
     #[test]
     fn worker_output_path_drives_the_effective_raw_target() {
-        let mut req = open_request(None, None);
+        let mut req = open_request(None);
         req.idb_out = Some("/tmp/public.i64".to_string());
         req.worker_idb_out = Some("  /tmp/worker.i64  ".to_string());
 
@@ -392,6 +390,92 @@ pub struct DecompileRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListLvarsRequest {
+    #[schemars(description = "One address in the function (string/number)")]
+    #[serde(alias = "addr", alias = "ea")]
+    pub address: Option<Value>,
+    #[schemars(
+        description = "Exact, case-sensitive function symbol (alternative to address; pass one)"
+    )]
+    #[serde(alias = "function_name")]
+    pub target_name: Option<String>,
+    #[schemars(description = "Pagination offset (default: 0)", range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(
+        description = "Maximum locals (1-1000, default: 100)",
+        range(min = 1, max = 1000)
+    )]
+    pub limit: Option<i64>,
+    #[schemars(
+        description = "Timeout in seconds (default: 120, max: 600)",
+        range(min = 1, max = 600)
+    )]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RenameLvarRequest {
+    #[schemars(description = "One address in the function (string/number)")]
+    #[serde(alias = "addr", alias = "ea")]
+    pub address: Option<Value>,
+    #[schemars(
+        description = "Exact, case-sensitive function symbol (alternative to address; pass one)"
+    )]
+    #[serde(alias = "function_name")]
+    pub target_name: Option<String>,
+    #[schemars(
+        description = "Exact, unique current local name (alternative to lvar_locator)",
+        length(min = 1, max = 1024)
+    )]
+    #[serde(alias = "old_name")]
+    pub lvar_name: Option<String>,
+    #[schemars(
+        description = "Opaque locator from list_lvars (preferred: display names can move to another local after reanalysis). Pass exactly one of lvar_locator or lvar_name.",
+        length(min = 1, max = 16384)
+    )]
+    pub lvar_locator: Option<String>,
+    #[schemars(description = "New local variable name", length(min = 1, max = 1024))]
+    pub new_name: String,
+    #[schemars(
+        description = "Timeout in seconds (default: 120, max: 600)",
+        range(min = 1, max = 600)
+    )]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetLvarTypeRequest {
+    #[schemars(description = "One address in the function (string/number)")]
+    #[serde(alias = "addr", alias = "ea")]
+    pub address: Option<Value>,
+    #[schemars(
+        description = "Exact, case-sensitive function symbol (alternative to address; pass one)"
+    )]
+    #[serde(alias = "function_name")]
+    pub target_name: Option<String>,
+    #[schemars(
+        description = "Exact, unique current local name (alternative to lvar_locator)",
+        length(min = 1, max = 1024)
+    )]
+    pub lvar_name: Option<String>,
+    #[schemars(
+        description = "Opaque locator from list_lvars (preferred: display names can move to another local after reanalysis). Pass exactly one of lvar_locator or lvar_name.",
+        length(min = 1, max = 16384)
+    )]
+    pub lvar_locator: Option<String>,
+    #[schemars(
+        description = "C type declaration, for example unsigned int",
+        length(min = 1, max = 16384)
+    )]
+    pub decl: String,
+    #[schemars(
+        description = "Timeout in seconds (default: 120, max: 600)",
+        range(min = 1, max = 600)
+    )]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct StringsRequest {
     #[schemars(description = "Offset for pagination (default: 0)")]
     #[schemars(range(min = 0))]
@@ -509,7 +593,7 @@ pub struct StructInfoRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadStructRequest {
-    #[schemars(description = "Address of struct instance (string/number)")]
+    #[schemars(description = "Address(es) of struct instances (string/number or array)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Value,
     #[schemars(description = "Struct ordinal (numeric)")]
@@ -525,7 +609,9 @@ pub struct ApplyTypesRequest {
     #[schemars(description = "Address to apply type (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function or symbol name (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive symbol name to type (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "name", alias = "symbol")]
     pub target_name: Option<String>,
     #[schemars(description = "Offset added to resolved name address (default: 0)")]
@@ -563,7 +649,9 @@ pub struct DeclareStackRequest {
     #[schemars(description = "Function address (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function name (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive name of the function (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "function", alias = "name")]
     pub target_name: Option<String>,
     #[schemars(description = "Stack offset in bytes (negative for locals, positive for args)")]
@@ -581,7 +669,9 @@ pub struct DeleteStackRequest {
     #[schemars(description = "Function address (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function name (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive name of the function (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "function", alias = "name")]
     pub target_name: Option<String>,
     #[schemars(description = "Stack offset in bytes (negative for locals, positive for args)")]
@@ -617,6 +707,15 @@ pub struct AddressRequest {
     pub address: Value,
 }
 
+/// One address for a tool that returns one result; a one-element array is
+/// accepted, anything longer is refused.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SingleAddressRequest {
+    #[schemars(description = "One address (string/number); a one-element array is accepted")]
+    #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
+    pub address: Value,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LuminaLookupRequest {
     #[schemars(description = "Function address (string/number)")]
@@ -637,7 +736,9 @@ pub struct LuminaApplyRequest {
     #[schemars(description = "Function address (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function name (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive name of the function or a symbol inside it (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "function", alias = "name", alias = "symbol")]
     pub target_name: Option<String>,
     #[schemars(description = "Offset added before resolving the containing function (default: 0)")]
@@ -706,7 +807,9 @@ pub struct SetCommentsRequest {
     #[schemars(description = "Address to comment (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function or symbol name to comment (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive symbol name to comment (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "name", alias = "symbol")]
     pub target_name: Option<String>,
     #[schemars(description = "Offset added to resolved name address (default: 0)")]
@@ -724,7 +827,9 @@ pub struct RenameRequest {
     #[schemars(description = "Address to rename (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Current name to resolve (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive current name (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "current", alias = "old_name", alias = "from")]
     pub current_name: Option<String>,
     #[schemars(description = "New name for the symbol")]
@@ -739,7 +844,9 @@ pub struct PatchRequest {
     #[schemars(description = "Address to patch (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function or symbol name to patch (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive symbol name to patch (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "name", alias = "symbol")]
     pub target_name: Option<String>,
     #[schemars(description = "Offset added to resolved name address (default: 0)")]
@@ -756,7 +863,9 @@ pub struct PatchAsmRequest {
     #[schemars(description = "Address to patch (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Option<Value>,
-    #[schemars(description = "Function or symbol name to patch (alternative to address)")]
+    #[schemars(
+        description = "Exact, case-sensitive symbol name to patch (alternative to address; pass one, not both)"
+    )]
     #[serde(alias = "name", alias = "symbol")]
     pub target_name: Option<String>,
     #[schemars(description = "Offset added to resolved name address (default: 0)")]
@@ -989,10 +1098,13 @@ pub struct GetGlobalValueRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct IntConvertRequest {
-    #[schemars(description = "Values to convert (string/number or array)")]
-    #[serde(alias = "input", alias = "inputs")]
-    pub inputs: Value,
+pub struct ReadIntRequest {
+    #[schemars(description = "Address(es) (string/number or array)")]
+    #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
+    pub address: Value,
+    #[schemars(description = "Integer width in bytes: 1, 2, 4, or 8.")]
+    #[schemars(range(min = 1, max = 8))]
+    pub size: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1002,6 +1114,57 @@ pub struct PseudocodeAtRequest {
     pub address: Value,
     #[schemars(description = "Optional end address for range query (for basic blocks)")]
     pub end_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListPseudocodeCommentsRequest {
+    #[schemars(description = "One address in the function (string/number)")]
+    #[serde(alias = "addr", alias = "ea")]
+    pub address: Option<Value>,
+    #[schemars(
+        description = "Exact, case-sensitive function symbol (alternative to address; pass one)"
+    )]
+    #[serde(alias = "function_name")]
+    pub target_name: Option<String>,
+    #[schemars(description = "Pagination offset (default: 0)", range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(
+        description = "Maximum locations (1-1000, default: 100)",
+        range(min = 1, max = 1000)
+    )]
+    pub limit: Option<i64>,
+    #[schemars(
+        description = "Timeout in seconds (default: 120, max: 600)",
+        range(min = 1, max = 600)
+    )]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetPseudocodeCommentRequest {
+    #[schemars(description = "One address in the function (string/number)")]
+    #[serde(alias = "addr", alias = "ea")]
+    pub address: Option<Value>,
+    #[schemars(
+        description = "Exact, case-sensitive function symbol (alternative to address; pass one)"
+    )]
+    #[serde(alias = "function_name")]
+    pub target_name: Option<String>,
+    #[schemars(
+        description = "Exact locator from list_pseudocode_comments",
+        length(min = 1, max = 128)
+    )]
+    pub comment_locator: String,
+    #[schemars(
+        description = "Comment text; empty string removes it (maximum 16384 UTF-8 bytes)",
+        length(max = 16384)
+    )]
+    pub comment: String,
+    #[schemars(
+        description = "Timeout in seconds (default: 120, max: 600)",
+        range(min = 1, max = 600)
+    )]
+    pub timeout_secs: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

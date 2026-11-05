@@ -211,6 +211,13 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Set rebuild=true when the input changed or stale analysis should be overwritten; \
                     overwrite is allowed only when the existing database's hash or recorded input path \
                     proves that it belongs to this input. \
+                    Universal (fat) Mach-O inputs need a slice: pass arch (e.g. arm64e, x86_64), or omit it \
+                    and answer the slice prompt when the client supports input requests (legacy clients \
+                    get 30s before the call fails). Without an answer the error lists the slices. The \
+                    chosen slice is copied to <input name>.<arch> beside the output database (an identical \
+                    copy is reused; a different file is never overwritten) and opened as a \
+                    single-architecture Mach-O; the response's universal field names it. The loader \
+                    field reports what IDA loaded, e.g. \"Mach-O file (EXECUTE). ARM64e\". \
                     Auto-analysis does NOT run by default — open returns quickly with the database \
                     loaded. Check analysis_status in the response: if auto_is_ok is false and you \
                     need xrefs/decompile, call analyze_funcs(background=true) and poll task_status. \
@@ -224,11 +231,12 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
                     In HTTP/SSE mode, keep the close_token returned by open_idb for sessionless MCP 2026 or cross-session close requests; the owning legacy session can close directly. \
                     Supports timeout_secs (default 300s, max 600s). Phase transitions are observable via recent_operations. \
-                    Returns metadata about the binary: file type, processor, bitness, function count, analysis_status.",
+                    Returns metadata about the binary: file type, loader, processor, bitness, function count, analysis_status.",
         example: r#"{"path": "/path/to/binary", "auto_analyse": false}"#,
         default: true,
         keywords: &[
-            "open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe",
+            "open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe", "fat",
+            "universal", "slice", "arch",
         ],
     },
     ToolInfo {
@@ -321,6 +329,20 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["analysis", "autoanalysis", "status", "xrefs", "decompile"],
     },
     ToolInfo {
+        name: "save_idb",
+        category: ToolCategory::Core,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "Save the open database without closing it",
+        full_desc: "Write the open database to its .i64/.idb path and keep it open; \
+                    returns that path. \
+                    Use it to checkpoint renames, comments, types, and patches before \
+                    risky operations; close_idb also saves.",
+        example: r#"{}"#,
+        default: true,
+        keywords: &["save", "checkpoint", "persist", "write", "database"],
+    },
+    ToolInfo {
         name: "close_idb",
         category: ToolCategory::Core,
         scope: ToolScope::Database,
@@ -402,8 +424,10 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         requirements: ToolRequirements::BASELINE,
         short_desc: "Get database metadata and summary",
         full_desc: "Returns metadata about the currently open database: \
-                    file type, processor architecture, bitness, entry points, \
-                    segment count, function count, and other summary info.",
+                    file type, loader, processor architecture, bitness, function count, \
+                    input path/size/hashes, image_base (the loaded image's base, which \
+                    rebasing updates), base_address (the paragraph base of segmented \
+                    formats; 0 for Mach-O/ELF/PE), min/max/main addresses.",
         example: r#"{}"#,
         default: true,
         keywords: &["info", "metadata", "summary", "database", "binary"],
@@ -430,18 +454,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         ],
     },
     ToolInfo {
-        name: "list_funcs",
-        category: ToolCategory::Functions,
-        scope: ToolScope::Database,
-        requirements: ToolRequirements::BASELINE,
-        short_desc: "Alias of list_functions",
-        full_desc: "Alias of list_functions. Lists all functions in the database with pagination \
-                    and optional name filtering.",
-        example: r#"{"offset": 0, "limit": 100, "filter": "init"}"#,
-        default: false,
-        keywords: &["functions", "list", "alias"],
-    },
-    ToolInfo {
         name: "resolve_function",
         category: ToolCategory::Functions,
         scope: ToolScope::Database,
@@ -458,7 +470,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Functions,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Find the function containing an address",
+        short_desc: "Find the function containing one address",
         full_desc: "Return the function that contains the given address, including start/end and size. \
                     Useful for mapping PC/LR to a function.",
         example: r#"{"address": "0x1000"}"#,
@@ -506,7 +518,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Disassembly,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Disassemble instructions at an address",
+        short_desc: "Disassemble instructions at one or more addresses",
         full_desc: "Disassemble machine code starting at the given address. \
                     Returns assembly instructions with addresses and opcodes. \
                     Specify count to control how many instructions to disassemble.",
@@ -545,7 +557,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Disassembly,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Disassemble the function containing an address",
+        short_desc: "Disassemble the function containing one address",
         full_desc: "Disassemble the function that contains the provided address. \
                     Useful when you only have a PC/LR.",
         example: r#"{"address": "0x1000", "count": 200}"#,
@@ -558,7 +570,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Decompile,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Decompile function to C pseudocode",
+        short_desc: "Decompile one or more functions to C pseudocode",
         full_desc: "Decompile a function using Hex-Rays decompiler (if available). \
                     Returns C-like pseudocode. Accepts address or function name.",
         example: r#"{"address": "0x1000"}"#,
@@ -570,7 +582,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Decompile,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Get pseudocode for specific address/range",
+        short_desc: "Get pseudocode for one or more addresses/ranges",
         full_desc: "Get decompiled pseudocode for a specific address or address range (e.g., a basic block). \
                     Unlike decompile which returns the full function, this returns only statements \
                     corresponding to the given address(es).",
@@ -578,13 +590,35 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["pseudocode", "decompile", "block", "range", "statement"],
     },
+    ToolInfo {
+        name: "list_lvars",
+        category: ToolCategory::Decompile,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "List decompiler locals and arguments in one function",
+        full_desc: "List Hex-Rays local names, types, locations, opaque edit locators when available, and argument flags. Select one address or an exact function symbol; results are paginated.",
+        example: r#"{"target_name": "main", "limit": 100}"#,
+        default: false,
+        keywords: &["decompiler", "locals", "variables", "arguments", "lvars"],
+    },
+    ToolInfo {
+        name: "list_pseudocode_comments",
+        category: ToolCategory::Decompile,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "List pseudocode comment locations in one function",
+        full_desc: "List the end-of-line comment locations in one function's Hex-Rays pseudocode, with each line's locator, address, text, and existing comment. Select one address or an exact function symbol; results are paginated.",
+        example: r#"{"target_name": "main", "limit": 100}"#,
+        default: false,
+        keywords: &["pseudocode", "decompiler", "comments", "locations"],
+    },
     // === XREFS ===
     ToolInfo {
         name: "xrefs_to",
         category: ToolCategory::Xrefs,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Find all references TO an address",
+        short_desc: "Find all references TO one or more addresses",
         full_desc: "Find all cross-references pointing to the given address. \
                     Shows what code/data references this location. \
                     Useful for finding callers, data usage, etc.",
@@ -597,7 +631,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Xrefs,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Find all references FROM an address",
+        short_desc: "Find all references FROM one or more addresses",
         full_desc: "Find all cross-references originating from the given address. \
                     Shows what this instruction/data references. \
                     Useful for finding callees, data accesses, etc.",
@@ -635,7 +669,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::ControlFlow,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Get basic blocks of a function",
+        short_desc: "Get basic blocks of one or more functions",
         full_desc: "Get the control flow graph basic blocks for a function. \
                     Returns block addresses, sizes, and successor relationships.",
         example: r#"{"address": "0x1000"}"#,
@@ -647,7 +681,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::ControlFlow,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Find all callers of a function",
+        short_desc: "Find all callers of one or more functions",
         full_desc: "Find all functions that call the specified function. \
                     Returns caller addresses and names.",
         example: r#"{"address": "0x1000"}"#,
@@ -659,7 +693,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::ControlFlow,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Find all functions called by a function",
+        short_desc: "Find all functions called by one or more functions",
         full_desc: "Find all functions that are called by the specified function. \
                     Returns callee addresses and names.",
         example: r#"{"address": "0x1000"}"#,
@@ -671,7 +705,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::ControlFlow,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Build call graph from a function",
+        short_desc: "Build call graph from one or more root functions",
         full_desc: "Build a call graph starting from a function. Direction is callees by default \
                     for compatibility, or callers/both when explicitly requested. Returns nodes \
                     and normalized caller-to-callee edges. The truncated flag is true when \
@@ -698,7 +732,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Memory,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Read raw bytes from an address",
+        short_desc: "Read raw bytes from one or more addresses",
         full_desc: "Read raw bytes from the database at the specified address. \
                     Returns bytes as hex string. Useful for examining data. \
                     You can also supply a symbol/function name with an optional offset.",
@@ -711,7 +745,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Memory,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Read string at an address",
+        short_desc: "Read strings at one or more addresses",
         full_desc: "Read a null-terminated string at the specified address. \
                     Supports C strings and other string types recognized by IDA.",
         example: r#"{"address": "0x1000"}"#,
@@ -719,48 +753,16 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["string", "read", "text", "ascii", "data"],
     },
     ToolInfo {
-        name: "get_u8",
+        name: "read_int",
         category: ToolCategory::Memory,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Read 8-bit value",
-        full_desc: "Read an unsigned 8-bit value (byte) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
+        short_desc: "Read unsigned integers of a given byte width at one or more addresses",
+        full_desc: "Read an unsigned integer at each address. size is the width in bytes \
+                    (1, 2, 4, or 8) and the value is read in the database's byte order.",
+        example: r#"{"address": "0x1000", "size": 4}"#,
         default: false,
-        keywords: &["byte", "u8", "read", "value"],
-    },
-    ToolInfo {
-        name: "get_u16",
-        category: ToolCategory::Memory,
-        scope: ToolScope::Database,
-        requirements: ToolRequirements::BASELINE,
-        short_desc: "Read 16-bit value",
-        full_desc: "Read an unsigned 16-bit value (word) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
-        default: false,
-        keywords: &["word", "u16", "read", "value"],
-    },
-    ToolInfo {
-        name: "get_u32",
-        category: ToolCategory::Memory,
-        scope: ToolScope::Database,
-        requirements: ToolRequirements::BASELINE,
-        short_desc: "Read 32-bit value",
-        full_desc: "Read an unsigned 32-bit value (dword) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
-        default: false,
-        keywords: &["dword", "u32", "read", "value"],
-    },
-    ToolInfo {
-        name: "get_u64",
-        category: ToolCategory::Memory,
-        scope: ToolScope::Database,
-        requirements: ToolRequirements::BASELINE,
-        short_desc: "Read 64-bit value",
-        full_desc: "Read an unsigned 64-bit value (qword) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
-        default: false,
-        keywords: &["qword", "u64", "read", "value"],
+        keywords: &["u8", "u16", "u32", "u64", "byte", "word", "dword", "qword", "read", "value"],
     },
     ToolInfo {
         name: "get_global_value",
@@ -772,17 +774,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         example: r#"{"query": "g_flag"}"#,
         default: false,
         keywords: &["global", "value", "read", "symbol", "data"],
-    },
-    ToolInfo {
-        name: "int_convert",
-        category: ToolCategory::Memory,
-        scope: ToolScope::Runtime,
-        requirements: ToolRequirements::BASELINE,
-        short_desc: "Convert integers between bases",
-        full_desc: "Convert integers between decimal/hex/binary and show ASCII bytes when possible.",
-        example: r#"{"inputs": ["0x41424344", 1234]}"#,
-        default: false,
-        keywords: &["int", "convert", "hex", "decimal", "ascii"],
     },
     // === SEARCH ===
     ToolInfo {
@@ -888,7 +879,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Metadata,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Resolve address to segment/function/symbol",
+        short_desc: "Resolve one address to segment/function/symbol",
         full_desc: "Return address context including segment info, containing function, \
                     and nearest named symbol.",
         example: r#"{"address": "0x1000"}"#,
@@ -1024,11 +1015,22 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["types", "apply", "annotations"],
     },
     ToolInfo {
+        name: "set_lvar_type",
+        category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "Set the type of one exact decompiler local variable",
+        full_desc: "Parse and persist a C type for one Hex-Rays local. Select an exact function and one local: a locator from list_lvars (preferred) or an exact, unique name. Invalid or incompatible types are rejected.",
+        example: r#"{"target_name": "main", "lvar_locator": "<locator from list_lvars>", "decl": "unsigned int"}"#,
+        default: false,
+        keywords: &["decompiler", "locals", "variables", "type", "lvars"],
+    },
+    ToolInfo {
         name: "infer_types",
         category: ToolCategory::Types,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Infer/guess type at an address",
+        short_desc: "Infer/guess type at one address",
         full_desc: "Guess a type for an address or symbol using IDA's heuristics.",
         example: r#"{"name": "interesting_function"}"#,
         default: false,
@@ -1039,7 +1041,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Types,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Get stack frame info",
+        short_desc: "Get stack frame info for one function",
         full_desc: "Get stack frame layout for the function at an address, including \
                     args/locals ranges and per-member type info.",
         example: r#"{"address": "0x1000"}"#,
@@ -1096,7 +1098,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Types,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Read a struct instance at an address",
+        short_desc: "Read struct instances at one or more addresses",
         full_desc: "Read raw bytes for each struct member at a given address.",
         example: r#"{"address": "0x1000", "name": "MyStruct"}"#,
         default: false,
@@ -1116,14 +1118,26 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     },
     // === EDITING / PATCHING ===
     ToolInfo {
+        name: "set_pseudocode_comment",
+        category: ToolCategory::Editing,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "Set a persistent pseudocode comment",
+        full_desc: "Set, replace, or remove a Hex-Rays pseudocode comment at an exact comment_locator from list_pseudocode_comments. Select one address or an exact function symbol. Empty text removes the comment; save_idb writes it to disk.",
+        example: r#"{"target_name": "main", "comment_locator": "<locator from list_pseudocode_comments>", "comment": "validated input"}"#,
+        default: false,
+        keywords: &["pseudocode", "decompiler", "comments", "annotate"],
+    },
+    ToolInfo {
         name: "set_comments",
         category: ToolCategory::Editing,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Set comments at an address",
-        full_desc: "Set a non-repeatable or repeatable comment at an address. \
+        short_desc: "Set a disassembly comment at an address",
+        full_desc: "Set a non-repeatable or repeatable disassembly comment at an address. \
                     Empty string clears the comment. You can also supply a symbol/function name \
-                    with an optional offset.",
+                    with an optional offset. Disassembly comments do not appear in Hex-Rays \
+                    pseudocode; use list_pseudocode_comments and set_pseudocode_comment for those.",
         example: r#"{"name": "interesting_function", "comment": "note", "repeatable": false}"#,
         default: false,
         keywords: &["comments", "set", "annotate"],
@@ -1176,6 +1190,17 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         example: r#"{"current_name": "interesting_function", "name": "interesting_function_renamed", "flags": 0}"#,
         default: false,
         keywords: &["rename", "symbol", "edit"],
+    },
+    ToolInfo {
+        name: "rename_lvar",
+        category: ToolCategory::Editing,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "Rename one exact decompiler local variable",
+        full_desc: "Persist a Hex-Rays local variable name. Select an exact function and one local: a locator from list_lvars (preferred) or an exact, unique name. Stale or ambiguous selectors change nothing. Use save_idb to write the database.",
+        example: r#"{"target_name": "main", "lvar_locator": "<locator from list_lvars>", "new_name": "count"}"#,
+        default: false,
+        keywords: &["decompiler", "locals", "variables", "rename", "lvars"],
     },
     // === DEBUGGER (explicit --enable-debugger opt-in) ===
     ToolInfo {
@@ -1279,7 +1304,12 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         full_desc: "Execute a Python script via IDAPython in the currently open database. \
                     Provide either 'code' (inline Python) or 'file' (path to a .py file). \
                     Has full access to all ida_* modules (ida_funcs, ida_bytes, ida_segment, etc.), \
-                    idc, and idautils. stdout and stderr are captured and returned. \
+                    idc, and idautils. stdout and stderr are captured and returned, and a \
+                    trailing expression is returned as `result`: strict JSON up to 1 MiB, or the \
+                    string of its repr() with result_is_repr=true when it is not JSON-serializable \
+                    or holds an integer outside the 64-bit range (a larger result fails the call). \
+                    Imports, variables, and functions persist between calls on the same \
+                    open database. \
                     Use this for custom analysis that goes beyond the built-in tools. \
                     Supports timeout_secs, records phase transitions in recent_operations, \
                     and requires that the IDAPython plugin is loaded (available by default in IDA Pro). \
@@ -1456,7 +1486,6 @@ mod tests {
                 "tool_help",
                 "recent_operations",
                 "task_status",
-                "int_convert",
                 "debug_status",
                 "list_databases",
             ])

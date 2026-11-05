@@ -34,7 +34,7 @@ use crate::ida::types::{DbInfo, DebugInfoLoad, RawBinaryTarget};
 use idalib::{IDBOpenOptions, IDB};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::ffi::OsString;
+use std::ffi::{c_char, CStr, OsString};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -55,11 +55,30 @@ pub(crate) fn database_bitness(db: &IDB) -> u32 {
     }
 }
 
-fn build_db_info(db: &IDB, path: &str, debug_info: Option<DebugInfoLoad>) -> DbInfo {
+unsafe extern "C" {
+    fn get_file_type_name(buf: *mut c_char, bufsize: usize) -> usize;
+}
+
+/// IDA's description of the loader that created the open database, e.g.
+/// `Fat Mach-O file, 2. X86_64` or `Mach-O file (EXECUTE). ARM64e`. For a
+/// universal input it names the slice IDA picked.
+pub(crate) fn loader_name() -> String {
+    let mut buf = [0_u8; 512];
+    // SAFETY: get_file_type_name writes at most `bufsize` bytes into `buf`,
+    // which is valid and exclusively borrowed for the call. It reads the open
+    // database's metadata and runs on the IDA main thread like every handler.
+    unsafe { get_file_type_name(buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
+    CStr::from_bytes_until_nul(&buf)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+pub fn build_db_info(db: &IDB, path: &str, debug_info: Option<DebugInfoLoad>) -> DbInfo {
     let meta = db.meta();
     DbInfo {
         path: path.to_string(),
         file_type: format!("{:?}", meta.filetype()),
+        loader: loader_name(),
         processor: db.processor().long_name(),
         bits: database_bitness(db),
         function_count: db.function_count(),
@@ -256,7 +275,7 @@ fn sha256_file(path: &Path, cancel: Option<&CancellationToken>) -> Result<[u8; 3
     sha256_reader(&mut file, path, cancel)
 }
 
-fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+pub(crate) fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
@@ -391,6 +410,23 @@ fn validate_raw_idb_output(input: &Path, output: &Path) -> Result<(), ToolError>
         )));
     }
     Ok(())
+}
+
+/// Write finished auto-analysis to disk right away. MCP clients end a
+/// server with SIGKILL when the conversation ends, so an analysis that only
+/// lives in memory is lost whenever the agent never saves or closes; the
+/// flush keeps the analysis, and a later kill loses only edits since.
+pub(crate) fn flush_analysis(db: &mut IDB, after: &str) {
+    match db.save_database() {
+        Ok(path) => info!(after, path = %path.display(), "Flushed analysis to disk"),
+        Err(error) => warn!(after, %error, "Could not flush analysis to disk"),
+    }
+}
+
+pub fn handle_save_database(idb: &mut Option<IDB>) -> Result<Value, ToolError> {
+    let db = idb.as_mut().ok_or(ToolError::NoDatabaseOpen)?;
+    let database_path = db.save_database()?;
+    Ok(json!({ "saved": true, "path": database_path.display().to_string() }))
 }
 
 fn open_existing_idb(
@@ -653,7 +689,6 @@ pub fn handle_open(
     debug_info_verbose: bool,
     force: bool,
     rebuild: bool,
-    file_type: Option<&str>,
     auto_analyse: bool,
     raw_target: &RawBinaryTarget,
     extra_args: &[String],
@@ -663,7 +698,6 @@ pub fn handle_open(
 ) -> Result<DbInfo, ToolError> {
     let expanded = expand_path(path);
     let debug_info_path = non_empty_trimmed(debug_info_path);
-    let file_type = non_empty_trimmed(file_type);
     ensure_not_cancelled(cancel.as_ref())?;
     let is_idb = has_ida_database_extension(&expanded);
     let raw_entry_point = normalized_raw_entry_point(raw_target);
@@ -941,10 +975,6 @@ pub fn handle_open(
         opts.auto_analyse(
             auto_analyse && raw_target.bitness.is_none() && raw_target.entry_point.is_none(),
         );
-        if let Some(ft) = file_type {
-            info!(file_type = ft, "Using file type selector (-T flag)");
-            opts.file_type(ft);
-        }
         if let Some(processor) = raw_target.processor.as_deref() {
             opts.processor(processor);
         }
@@ -1020,6 +1050,7 @@ pub fn handle_open(
             Some(OPEN_IDB_PROGRESS_TOTAL),
             "Raw binary open finished; collecting post-open analysis state",
         );
+        flush_analysis(&mut db, "open_idb");
     }
 
     let mut debug_info = None;
@@ -1238,9 +1269,9 @@ mod tests {
 
     #[test]
     fn init_database_args_preserves_user_args() {
-        let args = init_database_args(&["-Sscript.py".to_string(), "-Tpe".to_string()]);
+        let args = init_database_args(&["-Sscript.py".to_string(), "-pmetapc".to_string()]);
         assert!(args.iter().any(|arg| arg == "-Sscript.py"));
-        assert!(args.iter().any(|arg| arg == "-Tpe"));
+        assert!(args.iter().any(|arg| arg == "-pmetapc"));
     }
 
     #[test]
@@ -1382,7 +1413,7 @@ mod tests {
         let args = init_database_args(&[]);
         assert_eq!(args, vec!["-A".to_string()]);
 
-        let args = init_database_args(&["-A".to_string(), "-Tpe".to_string()]);
+        let args = init_database_args(&["-A".to_string(), "-pmetapc".to_string()]);
         assert_eq!(args.iter().filter(|arg| arg.as_str() == "-A").count(), 1);
     }
 

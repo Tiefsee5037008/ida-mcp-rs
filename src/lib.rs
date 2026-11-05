@@ -6,15 +6,17 @@
 //!
 //! # Architecture
 //!
-//! IDA **must** run on the main thread. The architecture is:
+//! IDA **must** run on the main thread of the process that hosts it. The
+//! architecture is:
 //!
-//! - **Main thread**: Runs the IDA worker loop (`ida::run_ida_loop`).
-//!   All idalib operations happen here.
+//! - **Worker process** (`ida-mcp worker`, also single-worker HTTP): the main
+//!   thread runs the IDA worker loop (`ida::run_ida_loop`); all idalib
+//!   operations happen there. A background thread runs the tokio runtime with
+//!   the MCP server and talks to the main thread via channels (`IdaWorker`).
 //!
-//! - **Background thread**: Runs the tokio runtime with the async MCP server.
-//!   Communicates with the main thread via channels.
-//!
-//! - **IdaWorker**: Handle for sending requests to the main thread.
+//! - **Router process** (default stdio, `--workspace`, pooled HTTP): no IDA;
+//!   it supervises worker processes through `ida::pool` and kills one whose
+//!   call overruns its bound.
 //!
 //! - **IdaMcpServer**: The MCP server that exposes tools for IDA operations.
 //!   Uses the `rmcp` crate for MCP protocol handling.
@@ -29,7 +31,6 @@
 //!
 //! ## Function Analysis
 //! - `list_functions`: List all functions (paginated)
-//! - `list_funcs`: Alias for list_functions (ida-pro-mcp compatibility)
 //! - `resolve_function`: Find a function by name
 //! - `function_at`: Find the function containing an address
 //! - `lookup_funcs`: Batch lookup by name/address (ida-pro-mcp compatibility)
@@ -66,12 +67,11 @@
 //!
 //! ## Memory
 //! - `get_bytes`: Read raw bytes from an address
-//! - `get_u8/get_u16/get_u32/get_u64`: Read integer values
+//! - `read_int`: Read unsigned integers of 1, 2, 4, or 8 bytes
 //! - `get_string`: Read string at address
 //! - `get_global_value`: Resolve global name/address and read value
 //! - `find_bytes`: Find byte patterns
 //! - `search`: Search text or immediates
-//! - `int_convert`: Convert integers between bases
 //!
 //! ## Headless limitations
 //! Debugger/UI/scripting features are not exposed in headless mode.
@@ -83,8 +83,10 @@ pub mod disasm;
 pub mod dsc;
 pub mod error;
 pub mod ida;
+pub mod macho_fat;
 pub mod server;
 pub mod tool_registry;
+pub mod transport;
 
 pub use error::ToolError;
 pub use ida::{

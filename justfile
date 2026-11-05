@@ -21,16 +21,22 @@ release:
     KACHE_DISABLED=1 cargo build --release
 
 # Build release binary linked against a specific IDA version (local testing, no publish)
-release-against ida_version="9.4":
+release-against ida_version="9.5":
     KACHE_DISABLED=1 IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
 
 # Build and publish prerelease (macOS ARM64 only, for local testing)
-prerelease ida_version="9.4": && (update-beta-cask ida_version)
+prerelease ida_version="9.5": && (update-beta-cask ida_version)
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     TARGET=$(git rev-parse HEAD)
+    if grep -Eq '^idalib(-build)? = \{ path' Cargo.toml; then
+        echo "error: Cargo.toml uses local idalib path deps; push the idalib branch and switch idalib/idalib-build back to its git source first" >&2
+        exit 1
+    fi
     KACHE_DISABLED=1 IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
+    # Never publish a build whose decompiler cannot attach to the targeted runtime.
+    (cd test && SERVER_BIN=../target/release/ida-mcp just test-decompile)
     mkdir -p dist
     rm -f "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
     tar -czvf "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" -C target/release ida-mcp -C "{{ justfile_directory() }}" README.md LICENSE
@@ -42,7 +48,7 @@ prerelease ida_version="9.4": && (update-beta-cask ida_version)
         "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
 
 # Update homebrew beta cask in tap
-update-beta-cask ida_version="9.4":
+update-beta-cask ida_version="9.5":
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
@@ -150,6 +156,18 @@ test: build
 test-decompile: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-decompile
 
+# Verify native Hex-Rays local-variable edits, persistence, and filtering.
+test-lvars: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just test-lvars
+
+# Verify exact pseudocode comment placement, persistence, and deletion.
+test-pseudocode-comments: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just test-pseudocode-comments
+
+# Verify bounded MCP frames preserve healthy workers and unsaved edits.
+test-message-limits: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just test-message-limits
+
 # Run HTTP integration test (debug)
 test-http: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-http
@@ -210,6 +228,14 @@ test-observability: build
 test-elicitation: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-elicitation
 
+# Verify mutating tools take exact targets and report them (debug)
+test-mutation-targets: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-mutation-targets
+
+# Verify universal (fat) Mach-O slice selection through open_idb (debug)
+test-universal: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-universal
+
 # Verify MCP 2026 discover/stateless lifecycle and the pooled legacy boundary.
 test-modern: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-modern
@@ -237,6 +263,18 @@ test-dsc dsc_path="": build
 # Verify that license validation succeeds during preflight or database open
 test-license: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=info just test-license
+
+# Verify a call stuck inside IDA times out, retires the child, and reopens on a fresh one (debug)
+test-stuck-call: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-stuck-call
+
+# Verify shared HTTP child retirement and ownership on both MCP lifecycles.
+test-http-stuck-call: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just test-http-stuck-call
+
+# Verify a shutdown signal saves the database and exits with stdin still open (debug)
+test-shutdown-signal: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-shutdown-signal
 
 # Run crash-guard integration test (triggers SIGSEGV, verifies server survives)
 test-crash-guard: build
@@ -285,10 +323,17 @@ bump:
         echo "Cargo.toml already at ${VERSION}"
     else
         sed -i '' "s/^version = \"${CURRENT}\"/version = \"${VERSION}\"/" Cargo.toml
-        sed -i '' "s/^version: '${CURRENT}'/version: '${VERSION}'/" snap/snapcraft.yaml
         cargo update -p ida-mcp
-        git add Cargo.toml Cargo.lock snap/snapcraft.yaml
+        git add Cargo.toml Cargo.lock
         git commit -m "chore: release ${VERSION}"
     fi
     git tag -a "$TAG" -m "Release $TAG"
     git push && git push --tags
+# Benchmark IDA MCP servers with Claude Code headless (paid API calls; run outside the sandbox).
+# Example: just bench --model claude-sonnet-5-5 --effort medium --trials 1
+bench *args: release
+    python3 bench/run.py --binary "$PWD/target/release/ida-mcp" {{ args }}
+
+# Validate the benchmark harness without a model: positive simulations plus negative controls.
+bench-simulate *args: build
+    python3 bench/run.py --binary "$PWD/target/debug/ida-mcp" --simulate --trials 1 {{ args }}
